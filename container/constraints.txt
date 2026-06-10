@@ -1,0 +1,34 @@
+# PA policy extraction — pip constraints file (passed as `-c constraints.txt`).
+#
+# WHY: requirements.txt deliberately leaves the Docling stack floating so pip can
+# satisfy the hard transformers==4.57.3 pin; this file narrows the rest of the
+# float for REPRODUCIBLE Actions builds without touching the requirements
+# themselves (a constraints file only constrains — it never adds packages).
+#
+# HOW THE PINS WERE CHOSEN: versions verified via importlib.metadata in the
+# local environment that replicated the CI test job. Packages that are NOT
+# installed locally (the heavy Docling/torch stack only resolves inside the
+# Docker build) are left floating with a TODO — pinning a version we cannot
+# verify against the transformers pin risks an unsatisfiable resolve, which the
+# requirements header explicitly warns about. To finish the lockdown: after a
+# green Actions build, read the resolved versions from the image
+# (`pip freeze`) and replace each TODO below.
+
+# ── Verified locally (safe, API-stable pins) ──────────────────────────────────
+requests==2.32.3
+openpyxl==3.1.5
+flask==3.1.3
+
+# ── Not installed locally — left floating until a CI build records them ───────
+# TODO: pin from the image's `pip freeze` after the next green build.
+# docling==        (requirements bounds it <3; must co-resolve with transformers==4.57.3)
+# docling-core==
+# docling-surya==
+# surya-ocr==
+# torch==          (CPU wheel index only carries specific versions; pin from the image)
+# google-genai==
+# waitress==
+# pandas==         (local env resolved pandas 3.0.3 WITHOUT the docling stack;
+#                   docling 2.x caps pandas<3, so pinning the local version
+#                   would make the Docker resolve unsatisfiable — pin the
+#                   co-resolved 2.x version from the image instead)

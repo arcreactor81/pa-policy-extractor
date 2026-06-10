@@ -1,0 +1,9 @@
+# Normalize line endings: store LF in the repo so the Linux CI runner and the
+# container Docker build always see LF, regardless of contributor OS.
+* text=auto eol=lf
+
+# Binary / never-normalize
+*.ipynb text eol=lf
+*.png binary
+*.jpg binary
+*.pdf binary

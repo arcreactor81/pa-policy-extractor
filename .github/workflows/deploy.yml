@@ -1,0 +1,114 @@
+# Deploy — push-to-deploy via GitHub Actions. This is the ONLY supported deploy
+# path: the author never builds Docker locally, and Cloudflare has no server-side
+# Dockerfile build. The GitHub runner DOES have Docker, so `wrangler deploy`
+# builds container/Dockerfile, pushes the image to Cloudflare's managed registry,
+# and deploys the Worker + container-backed Durable Object in one step. That is
+# the whole point: the heavy image build happens in the cloud, not on the laptop.
+#
+# GATED ON CI: this workflow no longer fires directly on push. It fires when the
+# `ci` workflow (ci.yml) COMPLETES on main, and the job below only runs when that
+# CI run actually SUCCEEDED — so a commit that fails the typecheck or the test
+# suites can never reach production. `workflow_dispatch` remains as the manual
+# escape hatch (Actions → deploy → Run workflow); it deliberately bypasses the
+# gate for emergencies, e.g. re-deploying a known-good commit after a secrets
+# change.
+#
+# Secrets required (Repository → Settings → Secrets and variables → Actions):
+#   CLOUDFLARE_API_TOKEN   — token with Workers + Containers deploy permissions.
+#   CLOUDFLARE_ACCOUNT_ID  — the Cloudflare account to deploy into.
+#
+# Worker secret (set ONCE, out of band — NOT a GitHub secret, never printed here):
+#   DEEPSEEK_API_KEY — `npx wrangler secret put DEEPSEEK_API_KEY` (or the
+#   Cloudflare dashboard → Worker → Settings → Variables → Secrets). Optionally
+#   CF_AIG_TOKEN the same way if your AI Gateway is "authenticated". These persist
+#   on the Worker across deploys, so the pipeline never embeds them in the image
+#   or this workflow.
+name: deploy
+
+on:
+  # Fires on every COMPLETION of the `ci` workflow on main (success or failure —
+  # GitHub has no conclusion filter here); the job-level `if` below is what
+  # enforces "successful CI on main only".
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: build container image + deploy worker
+    # The CI gate: deploy only when (a) manually dispatched (the escape hatch),
+    # or (b) the triggering `ci` run SUCCEEDED, on main, for a push. The extra
+    # `event == 'push'` check matters because ci.yml also runs on a weekly
+    # schedule / manual dispatch — those CI runs validate, but must not silently
+    # re-deploy an unchanged main.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # workflow_run checks out the default branch HEAD by default, which can
+          # have moved past the commit CI validated — pin to the exact validated
+          # commit instead. On workflow_dispatch this expression is empty, so
+          # checkout falls back to the ref the dispatch was run on.
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        # `npm ci` once a lockfile is committed; fall back to `npm install` until
+        # then so the first deploy is not blocked on the lockfile.
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            echo "no package-lock.json found — falling back to 'npm install' (commit the lockfile to enable 'npm ci')"
+            npm install
+          fi
+
+      - name: Check Cloudflare credentials are present
+        id: creds
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          ok=true
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+            echo "CLOUDFLARE_API_TOKEN is not set — skipping deploy."
+            ok=false
+          fi
+          if [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            echo "CLOUDFLARE_ACCOUNT_ID is not set — skipping deploy."
+            ok=false
+          fi
+          echo "ok=$ok" >> "$GITHUB_OUTPUT"
+
+      - name: Build container image + deploy Worker
+        # The runner's Docker builds container/Dockerfile and pushes it; wrangler
+        # then deploys the Worker + PaContainer Durable Object. Reminder: the
+        # DEEPSEEK_API_KEY Worker secret is set ONCE via `wrangler secret put`
+        # (or the dashboard) — it is intentionally NOT provided here and is never
+        # printed. Plain (non-secret) vars (CF_AIG_ACCOUNT_ID / CF_AIG_GATEWAY_ID
+        # / DEEPSEEK_MODEL / …) come from wrangler.jsonc.
+        if: ${{ steps.creds.outputs.ok == 'true' }}
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: deploy

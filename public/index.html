@@ -1,0 +1,920 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="light dark" />
+  <meta name="description" content="Prior-Authorization Access Analyzer — Plaque Psoriasis policy extraction with DeepSeek v4-pro + Docling on Cloudflare. OCR a PDF once, analyze many brands, streamed live." />
+  <title>Prior-Authorization Access Analyzer</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%93%8A%3C/text%3E%3C/svg%3E" />
+  <!-- Head bootstrap (same-origin, CSP-safe): flag JS so entrance reveals only
+       hide when JS can un-hide them, and apply the persisted theme before paint
+       (no FOUC). Loaded synchronously (no defer) so it runs before first paint.
+       Externalized from an inline <script> for CSP script-src 'self'. -->
+  <script src="/theme.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <!-- AURORA / MESH-GRADIENT BACKDROP (decorative, drifts via transform) -->
+  <div class="aurora" aria-hidden="true">
+    <span class="aurora__blob aurora__blob--1"></span>
+    <span class="aurora__blob aurora__blob--2"></span>
+    <span class="aurora__blob aurora__blob--3"></span>
+    <span class="aurora__blob aurora__blob--4"></span>
+  </div>
+
+  <header class="app-header">
+    <div class="wrap header-inner">
+      <div class="brand-mark reveal stagger" aria-hidden="true">
+        <svg viewBox="0 0 48 48" width="40" height="40" role="img" aria-label="logo">
+          <rect x="3" y="3" width="42" height="42" rx="11" fill="url(#lg)" />
+          <defs>
+            <linearGradient id="lg" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0" stop-color="#6366f1" />
+              <stop offset=".55" stop-color="#a855f7" />
+              <stop offset="1" stop-color="#ec4899" />
+            </linearGradient>
+          </defs>
+          <rect x="13" y="26" width="5" height="11" rx="1.5" fill="#fff" opacity=".95" />
+          <rect x="21.5" y="19" width="5" height="18" rx="1.5" fill="#fff" opacity=".95" />
+          <rect x="30" y="12" width="5" height="25" rx="1.5" fill="#fff" opacity=".95" />
+        </svg>
+      </div>
+      <div class="header-text reveal stagger">
+        <h1>Prior-Authorization Access Analyzer</h1>
+        <p class="subtitle">Plaque Psoriasis policy extraction &middot; DeepSeek v4-pro + Docling on Cloudflare</p>
+      </div>
+      <button id="theme-toggle" type="button" class="theme-toggle reveal stagger" aria-label="Toggle color theme" title="Toggle light / dark theme">
+        <svg class="icon-sun" viewBox="0 0 24 24" aria-hidden="true">
+          <circle cx="12" cy="12" r="4.2" fill="none" stroke="currentColor" stroke-width="1.8" />
+          <g stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+            <path d="M12 2.5v2.4M12 19.1v2.4M4.2 4.2l1.7 1.7M18.1 18.1l1.7 1.7M2.5 12h2.4M19.1 12h2.4M4.2 19.8l1.7-1.7M18.1 5.9l1.7-1.7" />
+          </g>
+        </svg>
+        <svg class="icon-moon" viewBox="0 0 24 24" aria-hidden="true">
+          <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"
+                d="M20 14.5A8 8 0 0 1 9.5 4 7 7 0 1 0 20 14.5z" />
+        </svg>
+      </button>
+    </div>
+  </header>
+
+  <main id="main" class="wrap" tabindex="-1">
+
+    <!-- INPUT PANEL -->
+    <section class="panel input-panel reveal stagger" aria-labelledby="input-heading">
+      <div class="input-headrow">
+        <div>
+          <h2 id="input-heading" class="panel-title">Analyze a policy</h2>
+          <p class="subtle panel-sub" id="input-sub-single">OCR one policy PDF once, then score it against one or more of the 15 brands. Results stream in live, brand by brand.</p>
+          <p class="subtle panel-sub" id="input-sub-batch" hidden>Queue several policy PDFs against the brands you pick. The job runs server-side &mdash; reconnectable, shareable by URL, and persistent. Results stream in per PDF.</p>
+          <p class="subtle panel-sub" id="input-sub-library" hidden>Browse, search and re-open every analysis you&rsquo;ve run. Filter by brand, filename, access score and date; click a row to reopen the full result; share any analysis by permalink.</p>
+        </div>
+        <!-- MODE SWITCH (Single live / Batch job / Library). Single is default. -->
+        <div class="mode-switch" role="tablist" aria-label="Analysis mode" data-modes="3">
+          <button id="mode-single" type="button" class="mode-tab is-active" role="tab" aria-selected="true">
+            <span class="mode-tab-name">Single</span>
+            <span class="mode-tab-hint">live</span>
+          </button>
+          <button id="mode-batch" type="button" class="mode-tab" role="tab" aria-selected="false">
+            <span class="mode-tab-name">Batch</span>
+            <span class="mode-tab-hint">job</span>
+          </button>
+          <button id="mode-library" type="button" class="mode-tab" role="tab" aria-selected="false">
+            <span class="mode-tab-name">Library</span>
+            <span class="mode-tab-hint">saved</span>
+          </button>
+          <span class="mode-switch-ind" aria-hidden="true"></span>
+        </div>
+      </div>
+
+      <!-- LIBRARY FILTER BAR (additive; shown only in Library mode) -->
+      <!-- CSS-driven visibility only: .library-only + body:not(.mode-library)
+           rules hide this until Library mode is active. No `hidden` attribute
+           here because library.js never holds a ref to this wrapper, so nothing
+           would ever remove it (the [hidden]{display:none !important} reset
+           would otherwise keep the facet filters permanently invisible). -->
+      <div class="library-filters library-only lib-analyses-view">
+        <div class="lib-filter-grid">
+          <div class="lib-field">
+            <label class="field-label" for="lib-brand">Brand</label>
+            <div class="lib-select-wrap">
+              <select id="lib-brand" class="lib-select">
+                <option value="">All brands</option>
+              </select>
+            </div>
+          </div>
+          <div class="lib-field">
+            <label class="field-label" for="lib-q">Filename contains</label>
+            <div class="lib-search-wrap">
+              <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+                <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+                      d="M11 18a7 7 0 1 0 0-14 7 7 0 0 0 0 14zM20 20l-3.5-3.5" />
+              </svg>
+              <input id="lib-q" type="text" class="lib-search" placeholder="Search filename…" autocomplete="off" />
+            </div>
+          </div>
+          <div class="lib-field lib-field-range">
+            <label class="field-label" for="lib-min-score">Access score</label>
+            <div class="lib-range-row">
+              <select id="lib-min-score" class="lib-select lib-select-sm" aria-label="Minimum access score">
+                <option value="">Min</option>
+                <option value="0">0</option>
+                <option value="25">25</option>
+                <option value="50">50</option>
+                <option value="75">75</option>
+                <option value="100">100</option>
+              </select>
+              <span class="lib-range-sep" aria-hidden="true">–</span>
+              <select id="lib-max-score" class="lib-select lib-select-sm" aria-label="Maximum access score">
+                <option value="">Max</option>
+                <option value="0">0</option>
+                <option value="25">25</option>
+                <option value="50">50</option>
+                <option value="75">75</option>
+                <option value="100">100</option>
+              </select>
+            </div>
+          </div>
+          <div class="lib-field">
+            <label class="field-label" for="lib-from">From</label>
+            <input id="lib-from" type="date" class="lib-date" aria-label="From date" />
+          </div>
+          <div class="lib-field">
+            <label class="field-label" for="lib-to">To</label>
+            <input id="lib-to" type="date" class="lib-date" aria-label="To date" />
+          </div>
+          <div class="lib-field lib-field-actions">
+            <button id="lib-search-btn" type="button" class="btn btn-primary btn-sm">
+              <svg class="btn-arrow" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+                <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"
+                      d="M11 18a7 7 0 1 0 0-14 7 7 0 0 0 0 14zM20 20l-3.5-3.5" />
+              </svg>
+              <span>Search</span>
+            </button>
+            <button id="lib-reset-btn" type="button" class="btn btn-ghost btn-sm">Reset</button>
+          </div>
+        </div>
+
+        <!-- QUICK PRESETS (W2 faceted search): one-click filters that drive the
+             same /api/library query. Wired by library.js. -->
+        <div class="lib-presets" role="group" aria-label="Quick filter presets">
+          <span class="lib-presets-label subtle">Quick filters</span>
+          <button type="button" class="lib-preset-chip" data-preset="restrictive">Restrictive (score &le; 25)</button>
+          <button type="button" class="lib-preset-chip" data-preset="open">Open access (score &ge; 75)</button>
+          <button type="button" class="lib-preset-chip" data-preset="this-brand" id="lib-preset-this-brand" hidden>This brand only</button>
+          <button type="button" class="lib-preset-chip" data-preset="last7">Last 7 days</button>
+          <button type="button" class="lib-preset-chip" data-preset="all">All</button>
+        </div>
+
+        <p class="hint subtle">Showing analyses saved under your account. Single analyses are saved when they finish; batch analyses are saved server-side when the job completes.</p>
+      </div>
+
+      <div class="input-grid mode-hide-library">
+        <div class="dropzone-col">
+          <!-- SINGLE-PDF picker (unchanged; default mode) -->
+          <div class="mode-pane" data-mode-pane="single">
+            <label id="dz-label" class="field-label" for="file-input">Policy PDF</label>
+            <div id="dropzone" class="dropzone" role="button" tabindex="0"
+                 aria-labelledby="dz-label" aria-describedby="dz-hint">
+              <input id="file-input" type="file" accept="application/pdf,.pdf" class="visually-hidden" />
+              <svg class="dz-icon" viewBox="0 0 24 24" width="38" height="38" aria-hidden="true">
+                <path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"
+                      d="M12 16V4m0 0L8 8m4-4l4 4M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" />
+              </svg>
+              <p class="dz-primary">Drag &amp; drop a PDF here</p>
+              <p id="dz-hint" class="dz-secondary">or <span class="link-like">browse files</span> &middot; max 20&nbsp;MB</p>
+              <div id="file-meta" class="file-meta" hidden>
+                <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+                  <path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"
+                        d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z M14 3v5h5" />
+                </svg>
+                <span id="file-name" class="file-name"></span>
+                <span id="file-size" class="file-size"></span>
+                <button id="file-clear" type="button" class="file-clear" aria-label="Remove file">&times;</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- BATCH multi-PDF picker (additive; hidden until Batch mode) -->
+          <div class="mode-pane" data-mode-pane="batch" hidden>
+            <label id="bz-label" class="field-label" for="batch-file-input">Policy PDFs <span id="batch-file-count" class="count-badge">0</span></label>
+            <div id="batch-dropzone" class="dropzone" role="button" tabindex="0"
+                 aria-labelledby="bz-label" aria-describedby="bz-hint">
+              <input id="batch-file-input" type="file" accept="application/pdf,.pdf" multiple class="visually-hidden" />
+              <svg class="dz-icon" viewBox="0 0 24 24" width="38" height="38" aria-hidden="true">
+                <path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"
+                      d="M4 7h5l2 2h9v9a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V7zM12 12v5m0-5l-2 2m2-2l2 2" />
+              </svg>
+              <p class="dz-primary">Drag &amp; drop several PDFs</p>
+              <p id="bz-hint" class="dz-secondary">or <span class="link-like">browse files</span> &middot; up to <span id="batch-max-pdfs">25</span> &middot; max 20&nbsp;MB each</p>
+            </div>
+            <ul id="batch-file-list" class="batch-file-list" aria-live="polite" hidden></ul>
+          </div>
+        </div>
+
+        <div class="controls-col">
+          <div class="control brand-control">
+            <div class="brand-head">
+              <label class="field-label" for="brand-search" id="brand-label">Brands <span id="brand-count" class="count-badge">0</span></label>
+              <button id="select-all" type="button" class="link-btn" aria-pressed="false">Select all 15</button>
+            </div>
+
+            <div class="brand-picker">
+              <div class="brand-search-wrap">
+                <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+                  <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+                        d="M11 18a7 7 0 1 0 0-14 7 7 0 0 0 0 14zM20 20l-3.5-3.5" />
+                </svg>
+                <input id="brand-search" type="text" class="brand-search" placeholder="Filter brands…"
+                       autocomplete="off" aria-describedby="brand-label" />
+              </div>
+              <ul id="brand-list" class="brand-list" role="group" aria-labelledby="brand-label"></ul>
+            </div>
+
+            <div id="brand-chips" class="brand-chips" aria-live="polite"></div>
+          </div>
+
+          <div class="control toggles-control">
+            <label class="toggle-row" for="deep-confidence">
+              <span class="toggle-switch">
+                <input id="deep-confidence" type="checkbox" class="toggle-input" />
+                <span class="toggle-track" aria-hidden="true"><span class="toggle-thumb"></span></span>
+              </span>
+              <span class="toggle-text">
+                <span class="toggle-name">Deep confidence</span>
+                <span class="toggle-hint subtle">Run extraction 3&times; and show per-field agreement. Triples LLM calls.</span>
+              </span>
+            </label>
+            <label class="toggle-row" for="source-quotes">
+              <span class="toggle-switch">
+                <input id="source-quotes" type="checkbox" class="toggle-input" checked />
+                <span class="toggle-track" aria-hidden="true"><span class="toggle-thumb"></span></span>
+              </span>
+              <span class="toggle-text">
+                <span class="toggle-name">Source quotes</span>
+                <span class="toggle-hint subtle">Surface the verbatim policy text supporting each field.</span>
+              </span>
+            </label>
+            <label class="toggle-row" for="consensus-toggle">
+              <span class="toggle-switch">
+                <!-- Checked by default: every upload gets 3-way cross-verification
+                     (DeepSeek + two Workers AI validators). Untick to save the
+                     ~2 validator calls per brand. -->
+                <input id="consensus-toggle" type="checkbox" class="toggle-input" checked />
+                <span class="toggle-track" aria-hidden="true"><span class="toggle-thumb"></span></span>
+              </span>
+              <span class="toggle-text">
+                <span class="toggle-name">Cross-check (validators)</span>
+                <span class="toggle-hint subtle">3-way verification, on by default: validator models (Workers AI) re-extract and per-field agreement is shown. DeepSeek stays canonical. Untick to reduce LLM calls.</span>
+              </span>
+            </label>
+          </div>
+
+          <!-- SINGLE-mode submit (default, unchanged) -->
+          <button id="analyze-btn" type="button" class="btn btn-primary mode-only-single" disabled>
+            <span class="btn-spinner" aria-hidden="true"></span>
+            <svg class="btn-arrow" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+              <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"
+                    d="M5 12h14M13 6l6 6-6 6" />
+            </svg>
+            <span id="analyze-label">Analyze policy</span>
+          </button>
+          <p class="hint subtle mode-only-single">The PDF is read once (OCR), then each chosen brand is scored against that text and streamed back as it finishes.</p>
+
+          <!-- BATCH-mode submit (additive; hidden until Batch mode) -->
+          <button id="batch-submit-btn" type="button" class="btn btn-primary mode-only-batch" hidden disabled>
+            <span class="btn-spinner" aria-hidden="true"></span>
+            <svg class="btn-arrow" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+              <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"
+                    d="M5 12h14M13 6l6 6-6 6" />
+            </svg>
+            <span id="batch-submit-label">Run batch job</span>
+          </button>
+          <p class="hint subtle mode-only-batch" hidden>Each PDF is OCR&rsquo;d once and scored against every selected brand server-side (2 at a time). You can close the tab and return via the link &mdash; results are kept for 7 days.</p>
+        </div>
+      </div>
+
+      <!-- CACHED-RESULT HINT (single mode): offered when a matching prior result
+           exists in the library, before re-running. Populated by library.js. -->
+      <div id="lib-cache-hint" class="lib-cache-hint mode-hide-batch mode-hide-library" hidden role="status">
+        <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+          <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"
+                d="M3 12a9 9 0 1 0 9-9 9 9 0 0 0-7.5 4M3 4v3.5H6.5M12 7v5l3.5 2" />
+        </svg>
+        <div class="lib-cache-text">
+          <p class="lib-cache-title">A cached result for this exact PDF &amp; settings is already in your library.</p>
+          <p class="lib-cache-sub subtle" id="lib-cache-sub"></p>
+        </div>
+        <div class="lib-cache-actions">
+          <button id="lib-cache-view" type="button" class="btn btn-ghost btn-sm">View cached result</button>
+          <button id="lib-cache-dismiss" type="button" class="btn btn-ghost btn-sm" aria-label="Dismiss and re-run instead">Re-run</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- STREAM / PROGRESS -->
+    <section id="progress" class="panel progress-panel mode-hide-batch mode-hide-library" aria-live="polite" hidden>
+      <div class="progress-head">
+        <div class="spinner" id="progress-spinner" aria-hidden="true"></div>
+        <div class="progress-headtext">
+          <p class="progress-title">Analyzing <strong id="progress-target"></strong>&hellip;</p>
+          <p class="progress-meta">
+            Elapsed <span id="elapsed" class="elapsed">0.0s</span>
+            <span class="dot">&middot;</span>
+            <span class="reassure">First analysis warms the OCR models &mdash; later runs reuse cached OCR. Keep the tab open.</span>
+          </p>
+        </div>
+      </div>
+
+      <!-- OCR stage -->
+      <div id="ocr-stage" class="stage-row" hidden>
+        <span class="stage-icon" id="ocr-icon" aria-hidden="true"></span>
+        <div class="stage-body">
+          <span class="stage-name">OCR &mdash; reading the PDF</span>
+          <span id="ocr-detail" class="stage-detail subtle"></span>
+        </div>
+      </div>
+
+      <!-- Per-brand progress list -->
+      <ul id="brand-progress" class="brand-progress" hidden></ul>
+    </section>
+
+    <!-- GLOBAL ERROR -->
+    <section id="error-box" class="panel error-panel mode-hide-batch mode-hide-library" role="alert" hidden>
+      <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+        <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"
+              d="M12 8v5m0 3h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />
+      </svg>
+      <div>
+        <p class="error-title">Analysis failed</p>
+        <p id="error-message" class="error-message"></p>
+      </div>
+    </section>
+
+    <!-- MULTI-BRAND COMPARISON (only when >1 brand) -->
+    <section id="comparison" class="panel comparison-panel reveal mode-hide-batch mode-hide-library" aria-labelledby="comparison-heading" hidden>
+      <h2 id="comparison-heading" class="panel-title">Brand comparison</h2>
+      <p class="subtle panel-sub">Access score and key barriers for every brand scored against this policy.</p>
+      <div class="table-scroll">
+        <table class="compare-table">
+          <thead>
+            <tr>
+              <th scope="col">Brand</th>
+              <th scope="col">Access</th>
+              <th scope="col">Branded steps</th>
+              <th scope="col">Generic steps</th>
+              <th scope="col">Phototherapy</th>
+              <th scope="col">TB</th>
+              <th scope="col">Specialist</th>
+              <th scope="col">Reauth</th>
+            </tr>
+          </thead>
+          <tbody id="compare-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- BRAND-VS-BRAND HEATMAP (W2): compact score + barrier grid for the
+         brands of THIS policy. Inline SVG/CSS, built by analytics.js. -->
+    <section id="single-heatmap" class="panel heatmap-panel reveal mode-hide-batch mode-hide-library" aria-labelledby="single-heatmap-heading" hidden>
+      <h2 id="single-heatmap-heading" class="panel-title">Brand-vs-brand heatmap</h2>
+      <p class="subtle panel-sub">Access score and key barriers for every brand scored against this policy, as a colour-coded grid.</p>
+      <div id="single-heatmap-host" class="heatmap-host"></div>
+    </section>
+
+    <!-- RESULTS: one card per brand, streamed in -->
+    <section id="results" class="results mode-hide-batch mode-hide-library" aria-live="polite" hidden>
+      <!-- SAVE / PERMALINK strip: appears once a single analysis is persisted to
+           the library. Populated by library.js after the 'done' event. -->
+      <div id="lib-save-bar" class="lib-save-bar" hidden>
+        <span class="lib-save-ico" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="18" height="18">
+            <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"
+                  d="M5 13l4 4L19 7" />
+          </svg>
+        </span>
+        <span id="lib-save-text" class="lib-save-text">Saved to your library</span>
+        <button id="lib-save-copy" type="button" class="btn btn-ghost btn-sm" hidden>Copy link</button>
+        <span id="lib-save-status" class="copy-status" aria-live="polite"></span>
+      </div>
+      <div id="cards-host"></div>
+    </section>
+
+    <!-- ============================ BATCH MODE ============================ -->
+    <!-- All batch UI lives under .batch-only and is hidden in Single mode.   -->
+
+    <!-- BATCH JOB HEADER: status, shareable link, reconnect state -->
+    <section id="batch-job" class="panel batch-job-panel batch-only" aria-labelledby="batch-job-heading" hidden>
+      <div class="batch-job-head">
+        <div class="batch-job-titlewrap">
+          <span id="batch-conn-dot" class="conn-dot" data-state="idle" aria-hidden="true"></span>
+          <div>
+            <h2 id="batch-job-heading" class="panel-title">Batch job</h2>
+            <p class="subtle batch-job-sub">
+              <span id="batch-status-text">Preparing…</span>
+              <span class="dot">&middot;</span>
+              <span id="batch-conn-text" class="batch-conn-text">connecting</span>
+            </p>
+          </div>
+        </div>
+        <div class="batch-job-actions">
+          <button id="batch-copy-link" type="button" class="btn btn-ghost btn-sm" hidden>Copy share link</button>
+          <button id="batch-download-all" type="button" class="btn btn-ghost btn-sm" hidden>Download all JSON</button>
+          <!-- W5: save this finished job as a reusable, persistent cohort. Shown
+               by cohorts.js once the job completes; wired CSP-safely there. -->
+          <button id="batch-save-cohort" type="button" class="btn btn-ghost btn-sm" hidden>Save as cohort</button>
+          <span id="batch-copy-status" class="copy-status" aria-live="polite"></span>
+        </div>
+      </div>
+
+      <!-- Batch progress summary: X / Y PDFs done -->
+      <div class="batch-progress-summary">
+        <div class="batch-prog-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <span id="batch-prog-fill" class="batch-prog-fill" style="transform:scaleX(0)"></span>
+        </div>
+        <div class="batch-prog-stats stat-row">
+          <div class="stat"><div class="stat-k">PDFs done</div><div class="stat-v"><span id="batch-done-count">0</span> / <span id="batch-total-count">0</span></div></div>
+          <div class="stat"><div class="stat-k">Failed</div><div class="stat-v" id="batch-failed-count">0</div></div>
+          <div class="stat"><div class="stat-k">Brands each</div><div class="stat-v" id="batch-brands-count">—</div></div>
+          <div class="stat"><div class="stat-k">Elapsed</div><div class="stat-v" id="batch-elapsed">0.0s</div></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- BATCH ERROR -->
+    <section id="batch-error" class="panel error-panel batch-only" role="alert" hidden>
+      <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+        <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"
+              d="M12 8v5m0 3h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />
+      </svg>
+      <div>
+        <p class="error-title">Batch job error</p>
+        <p id="batch-error-message" class="error-message"></p>
+      </div>
+    </section>
+
+    <!-- BATCH COMPARISON (aggregated across the whole batch) -->
+    <section id="batch-comparison" class="panel comparison-panel batch-only" aria-labelledby="batch-comparison-heading" hidden>
+      <h2 id="batch-comparison-heading" class="panel-title">Batch comparison</h2>
+      <p class="subtle panel-sub">Access score and key barriers for every brand &times; PDF scored in this job.</p>
+      <div class="table-scroll">
+        <table class="compare-table">
+          <thead>
+            <tr>
+              <th scope="col">PDF</th>
+              <th scope="col">Brand</th>
+              <th scope="col">Access</th>
+              <th scope="col">Branded steps</th>
+              <th scope="col">Generic steps</th>
+              <th scope="col">Phototherapy</th>
+              <th scope="col">TB</th>
+              <th scope="col">Specialist</th>
+              <th scope="col">Reauth</th>
+            </tr>
+          </thead>
+          <tbody id="batch-compare-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- BATCH DISTRIBUTION (aggregated across the whole batch) -->
+    <section id="batch-dist" class="panel session-panel batch-only" aria-labelledby="batch-dist-heading" hidden>
+      <div class="session-head">
+        <h2 id="batch-dist-heading" class="panel-title">Batch analytics <span id="batch-dist-scope" class="subtle dist-scope"></span></h2>
+      </div>
+      <div class="dist-col">
+        <svg id="batch-dist-chart" viewBox="0 0 320 180" class="dist-chart" role="img" aria-labelledby="batch-dist-title">
+          <title id="batch-dist-title">Distribution of access scores across the batch</title>
+        </svg>
+      </div>
+    </section>
+
+    <!-- BATCH RESULTS: a per-PDF section (filename heading) of brand cards -->
+    <section id="batch-results" class="results batch-only" aria-live="polite" hidden>
+      <div id="batch-results-host"></div>
+    </section>
+
+    <!-- Per-PDF section template (cloned by batch.js; brand cards go inside) -->
+    <template id="batch-pdf-section-tpl">
+      <section class="batch-pdf reveal" data-pdf-index="">
+        <header class="batch-pdf-head">
+          <span class="batch-pdf-spinner" aria-hidden="true"></span>
+          <svg class="batch-pdf-icon" viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+            <path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"
+                  d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z M14 3v5h5" />
+          </svg>
+          <h3 class="batch-pdf-name"></h3>
+          <span class="batch-pdf-status pill pill-ghost"></span>
+        </header>
+        <!-- BRAND-VS-BRAND HEATMAP for this PDF's brands (W2; built by analytics.js). -->
+        <div class="batch-pdf-heatmap heatmap-host"></div>
+        <div class="batch-pdf-cards"></div>
+      </section>
+    </template>
+
+    <!-- ========================== END BATCH MODE ========================= -->
+
+    <!-- ============================ LIBRARY MODE ========================= -->
+    <!-- All library UI lives under .library-only and is hidden in other modes. -->
+
+    <!-- LIBRARY ERROR -->
+    <section id="lib-error" class="panel error-panel library-only" role="alert" hidden>
+      <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+        <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"
+              d="M12 8v5m0 3h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />
+      </svg>
+      <div>
+        <p class="error-title">Library error</p>
+        <p id="lib-error-message" class="error-message"></p>
+      </div>
+    </section>
+
+    <!-- ============================ W5 COHORTS ========================== -->
+    <!-- Cohorts are a SUB-VIEW of Library mode (reachable from the Library/modes
+         area) so the 3-way mode switch geometry is untouched. This segmented
+         control flips between "Analyses" (the saved-analyses browser + bench +
+         detail, all driven by library.js) and "Cohorts" (the management view
+         below, driven by cohorts.js). Both live under .library-only, so they are
+         only ever visible in Library mode. Wired CSP-safely by cohorts.js. -->
+    <div id="lib-view-switch" class="library-only lib-view-switch" role="tablist" aria-label="Library view" hidden>
+      <button id="lib-view-analyses" type="button" class="lib-view-tab is-active" role="tab" aria-selected="true">Analyses</button>
+      <button id="lib-view-cohorts" type="button" class="lib-view-tab" role="tab" aria-selected="false">
+        Cohorts <span id="cohorts-count" class="count-badge">0</span>
+      </button>
+    </div>
+
+    <!-- COHORTS ERROR -->
+    <section id="cohorts-error" class="panel error-panel library-only cohorts-view" role="alert" hidden>
+      <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+        <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"
+              d="M12 8v5m0 3h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />
+      </svg>
+      <div>
+        <p class="error-title">Cohorts error</p>
+        <p id="cohorts-error-message" class="error-message"></p>
+      </div>
+    </section>
+
+    <!-- COHORTS LIST: the owner's saved cohorts -->
+    <section id="cohorts-list-panel" class="panel library-only cohorts-view" aria-labelledby="cohorts-heading" hidden>
+      <div class="session-head">
+        <h2 id="cohorts-heading" class="panel-title">Saved cohorts <span id="cohorts-total" class="count-badge">0</span></h2>
+        <button id="cohorts-refresh" type="button" class="btn btn-ghost btn-sm">Refresh</button>
+      </div>
+      <p class="subtle panel-sub">
+        A cohort is a named, persistent set of policy PDFs you can re-run on demand or on a schedule. Re-running creates a new versioned run you can compare against any prior run. Create one with &ldquo;Save as cohort&rdquo; on a finished batch job.
+      </p>
+
+      <div id="cohorts-empty" class="lib-empty subtle" hidden>
+        <p>No cohorts yet. Run a Batch job, then use &ldquo;Save as cohort&rdquo; on the finished job to capture its PDFs and settings as a reusable cohort.</p>
+      </div>
+
+      <div id="cohorts-cards" class="cohorts-cards" hidden></div>
+    </section>
+
+    <!-- COHORT DETAIL: runs/versions list + webhook/schedule config + compare -->
+    <section id="cohort-detail" class="panel library-only cohorts-view" aria-labelledby="cohort-detail-heading" hidden>
+      <div class="lib-detail-bar">
+        <button id="cohort-detail-back" type="button" class="btn btn-ghost btn-sm">
+          <span aria-hidden="true">&larr;</span> Back to cohorts
+        </button>
+        <span id="cohort-detail-title" class="lib-detail-title subtle"></span>
+      </div>
+
+      <div class="cohort-detail-head">
+        <div>
+          <h2 id="cohort-detail-heading" class="panel-title cohort-detail-name">Cohort</h2>
+          <p class="subtle cohort-detail-meta" id="cohort-detail-meta"></p>
+        </div>
+        <div class="cohort-detail-actions">
+          <button id="cohort-run-now" type="button" class="btn btn-primary btn-sm">
+            <span class="btn-spinner" aria-hidden="true"></span>
+            <svg class="btn-arrow" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+              <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"
+                    d="M5 12h14M13 6l6 6-6 6" />
+            </svg>
+            <span>Run now</span>
+          </button>
+          <button id="cohort-delete" type="button" class="btn btn-ghost btn-sm cohort-delete-btn">Delete cohort</button>
+        </div>
+      </div>
+
+      <!-- WEBHOOK + SCHEDULE config (PATCH /api/cohorts/:id) -->
+      <section class="cohort-config" aria-labelledby="cohort-config-heading">
+        <h3 id="cohort-config-heading" class="group-title small">Notifications &amp; schedule</h3>
+        <div class="cohort-config-grid">
+          <div class="lib-field cohort-webhook-field">
+            <label class="field-label" for="cohort-webhook">Webhook URL <span class="subtle">(https, posted on each run finish)</span></label>
+            <div class="lib-search-wrap">
+              <input id="cohort-webhook" type="url" class="lib-search" placeholder="https://example.com/hooks/pa" autocomplete="off" inputmode="url" />
+            </div>
+            <p class="hint subtle" id="cohort-webhook-hint">Sent a JSON run summary when a run finishes. https only; localhost / private / metadata hosts are rejected server-side.</p>
+          </div>
+          <label class="toggle-row cohort-schedule-row" for="cohort-schedule">
+            <span class="toggle-switch">
+              <input id="cohort-schedule" type="checkbox" class="toggle-input" />
+              <span class="toggle-track" aria-hidden="true"><span class="toggle-thumb"></span></span>
+            </span>
+            <span class="toggle-text">
+              <span class="toggle-name">Daily schedule</span>
+              <span class="toggle-hint subtle">Re-run this cohort automatically once a day via the Worker cron. Each scheduled run spends container vCPU-minutes &mdash; off by default.</span>
+            </span>
+          </label>
+        </div>
+        <div class="cohort-config-save">
+          <button id="cohort-config-savebtn" type="button" class="btn btn-ghost btn-sm">Save settings</button>
+          <span id="cohort-config-status" class="copy-status" aria-live="polite"></span>
+        </div>
+      </section>
+
+      <!-- RUNS / VERSIONS list -->
+      <section class="cohort-runs" aria-labelledby="cohort-runs-heading">
+        <div class="session-head cohort-runs-head">
+          <h3 id="cohort-runs-heading" class="group-title small">Runs &amp; versions <span id="cohort-runs-count" class="count-badge">0</span></h3>
+          <button id="cohort-compare-btn" type="button" class="btn btn-ghost btn-sm" disabled>Compare selected</button>
+        </div>
+        <p class="subtle cohort-runs-hint" id="cohort-runs-hint">Select two runs (A and B) to compare field-level changes between versions.</p>
+
+        <div id="cohort-runs-empty" class="lib-empty subtle" hidden>
+          <p>No runs yet. Use &ldquo;Run now&rdquo; to create the first version.</p>
+        </div>
+
+        <div id="cohort-runs-wrap" class="table-scroll" hidden>
+          <table class="history-table cohort-runs-table">
+            <thead>
+              <tr>
+                <th scope="col">Compare</th>
+                <th scope="col">Run</th>
+                <th scope="col">Status</th>
+                <th scope="col">Summary</th>
+                <th scope="col">When</th>
+                <th scope="col"></th>
+              </tr>
+            </thead>
+            <tbody id="cohort-runs-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- COMPARE DIFF: field-level changes between two runs -->
+      <section id="cohort-compare" class="cohort-compare" aria-labelledby="cohort-compare-heading" hidden>
+        <div class="session-head cohort-compare-head">
+          <h3 id="cohort-compare-heading" class="group-title small">Version diff <span id="cohort-compare-scope" class="subtle"></span></h3>
+          <button id="cohort-compare-close" type="button" class="btn btn-ghost btn-sm">Close diff</button>
+        </div>
+        <p class="subtle" id="cohort-compare-summary"></p>
+        <div id="cohort-compare-empty" class="lib-empty subtle" hidden>
+          <p>No field-level changes between these two runs &mdash; the extracted policy fields are identical.</p>
+        </div>
+        <div id="cohort-compare-wrap" class="table-scroll" hidden>
+          <table class="history-table cohort-diff-table">
+            <thead>
+              <tr>
+                <th scope="col">PDF</th>
+                <th scope="col">Brand</th>
+                <th scope="col">Field</th>
+                <th scope="col">Run A</th>
+                <th scope="col">Run B</th>
+              </tr>
+            </thead>
+            <tbody id="cohort-diff-body"></tbody>
+          </table>
+        </div>
+      </section>
+    </section>
+    <!-- ========================== END W5 COHORTS ======================== -->
+
+    <!-- LIBRARY BROWSER: faceted table of saved analyses -->
+    <section id="lib-browser" class="panel library-only lib-analyses-view" aria-labelledby="lib-browser-heading" hidden>
+      <div class="session-head">
+        <h2 id="lib-browser-heading" class="panel-title">Saved analyses <span id="lib-total" class="count-badge">0</span></h2>
+        <button id="lib-refresh" type="button" class="btn btn-ghost btn-sm">Refresh</button>
+      </div>
+
+      <div id="lib-empty" class="lib-empty subtle" hidden>
+        <p>No saved analyses match these filters yet. Run a Single or Batch analysis &mdash; results are saved automatically and will appear here.</p>
+      </div>
+
+      <div id="lib-table-wrap" class="table-scroll" hidden>
+        <table class="history-table lib-table">
+          <thead>
+            <tr>
+              <th scope="col">File</th>
+              <th scope="col">Brand</th>
+              <th scope="col">Access</th>
+              <th scope="col">Kind</th>
+              <th scope="col">Saved</th>
+            </tr>
+          </thead>
+          <tbody id="lib-table-body"></tbody>
+        </table>
+      </div>
+
+      <!-- Pagination -->
+      <div id="lib-pager" class="lib-pager" hidden>
+        <button id="lib-prev" type="button" class="btn btn-ghost btn-sm">Previous</button>
+        <span id="lib-page-info" class="subtle lib-page-info" aria-live="polite"></span>
+        <button id="lib-next" type="button" class="btn btn-ghost btn-sm">Next</button>
+      </div>
+    </section>
+
+    <!-- CROSS-PAYER BENCHMARKING (W2): pick a brand -> aggregate that brand's
+         Access Score across every saved policy/payer. Aggregated client-side
+         from /api/library rows. Built by analytics.js. -->
+    <section id="lib-bench" class="panel library-only lib-analyses-view" aria-labelledby="lib-bench-heading" hidden>
+      <div class="session-head">
+        <h2 id="lib-bench-heading" class="panel-title">Cross-payer benchmarking <span id="lib-bench-brand" class="pill pill-brand"></span></h2>
+        <button id="lib-bench-refresh" type="button" class="btn btn-ghost btn-sm">Refresh</button>
+      </div>
+      <p class="subtle panel-sub" id="lib-bench-sub">Pick a single brand in the filter bar above to benchmark its Access Score across every policy you&rsquo;ve saved.</p>
+
+      <div id="lib-bench-empty" class="lib-empty subtle" hidden>
+        <p>No saved analyses for this brand yet. Run an analysis for it, or pick another brand.</p>
+      </div>
+
+      <div id="lib-bench-body" class="lib-bench-body" hidden>
+        <!-- most / least restrictive callout -->
+        <div id="lib-bench-callout" class="lib-bench-callout"></div>
+        <!-- per-policy horizontal score bars -->
+        <h3 class="group-title small">Access score by policy <span id="lib-bench-count" class="count-badge">0</span></h3>
+        <div id="lib-bench-bars" class="lib-bench-bars"></div>
+        <!-- barrier-frequency summary -->
+        <h3 class="group-title small lib-bench-freq-title">Barrier frequency across policies</h3>
+        <div id="lib-bench-freq" class="lib-bench-freq"></div>
+      </div>
+    </section>
+
+    <!-- LIBRARY DETAIL: the full result of the clicked / permalinked row,
+         rendered read-only via the shared #result-card-tpl renderers. -->
+    <section id="lib-detail" class="results library-only lib-analyses-view" aria-live="polite" hidden>
+      <div class="lib-detail-bar">
+        <button id="lib-detail-back" type="button" class="btn btn-ghost btn-sm">
+          <span aria-hidden="true">&larr;</span> Back to library
+        </button>
+        <span id="lib-detail-title" class="lib-detail-title subtle"></span>
+        <button id="lib-detail-copy" type="button" class="btn btn-ghost btn-sm">Copy link</button>
+        <span id="lib-detail-status" class="copy-status" aria-live="polite"></span>
+      </div>
+      <!-- BRAND-VS-BRAND HEATMAP for the saved result's brand (W2; analytics.js). -->
+      <div id="lib-detail-heatmap" class="heatmap-host"></div>
+      <div id="lib-detail-host"></div>
+    </section>
+
+    <!-- ========================== END LIBRARY MODE ======================= -->
+
+    <!-- SESSION HISTORY / DASHBOARD -->
+    <section id="session-panel" class="panel session-panel reveal mode-hide-batch mode-hide-library" aria-labelledby="session-heading" hidden>
+      <div class="session-head">
+        <h2 id="session-heading" class="panel-title">Session analytics</h2>
+        <button id="clear-history" type="button" class="btn btn-ghost btn-sm">Clear history</button>
+      </div>
+
+      <div class="session-grid">
+        <div class="dist-col">
+          <h3 class="group-title small" id="dist-title-h">Access-score distribution <span id="dist-scope" class="subtle dist-scope"></span></h3>
+          <svg id="dist-chart" viewBox="0 0 320 180" class="dist-chart" role="img" aria-labelledby="dist-title">
+            <title id="dist-title">Distribution of access scores</title>
+          </svg>
+        </div>
+        <div class="history-col">
+          <h3 class="group-title small">Analyzed policies <span id="history-count" class="count-badge">0</span></h3>
+          <div class="table-scroll">
+            <table class="history-table">
+              <thead>
+                <tr>
+                  <th scope="col">Brand</th>
+                  <th scope="col">File</th>
+                  <th scope="col">Score</th>
+                  <th scope="col">Key barriers</th>
+                  <th scope="col">Time</th>
+                </tr>
+              </thead>
+              <tbody id="history-body"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- PER-BRAND RESULT CARD TEMPLATE (cloned by app.js for each brand) -->
+  <template id="result-card-tpl">
+    <article class="brand-result panel" data-brand="">
+      <header class="brand-result-head">
+        <span class="pill pill-brand result-brand"></span>
+        <span class="result-file subtle"></span>
+        <!-- Overall confidence summary; populated only when runs>1. -->
+        <span class="result-conf" hidden></span>
+        <!-- Cross-check (W3) summary: "models agree on X/12 fields", where X is
+             the number of UNANIMOUS fields and the denominator is the number of
+             consensus columns actually compared (the 12 extraction columns;
+             Access Score is excluded). Populated only when the result carries a
+             `consensus` map; hidden entirely otherwise. -->
+        <span class="result-consensus" hidden></span>
+      </header>
+
+      <!-- ACCESS SCORE -->
+      <section class="score-panel" aria-label="Access score">
+        <div class="score-head">
+          <div>
+            <h3 class="panel-title">Access score</h3>
+            <p class="score-context"><span class="score-bucket-label bucket-label">&mdash;</span> <span class="score-bucket-meaning bucket-meaning"></span><span class="score-conf-slot"></span></p>
+          </div>
+          <div class="score-bignum">
+            <span class="score-value">--</span><span class="score-outof">/100</span>
+          </div>
+        </div>
+
+        <div class="gauge-wrap">
+          <svg viewBox="0 0 520 120" class="gauge gauge-svg" role="img" aria-label="Access score gauge"></svg>
+        </div>
+
+        <figure class="justification">
+          <svg class="quote-mark" viewBox="0 0 24 24" width="26" height="26" aria-hidden="true">
+            <path fill="currentColor" d="M7 7h4v4H8c0 2 1 3 3 3v3c-3 0-6-2-6-6V7zm9 0h4v4h-3c0 2 1 3 3 3v3c-3 0-6-2-6-6V7z"/>
+          </svg>
+          <blockquote class="justification-text"></blockquote>
+          <figcaption class="subtle">Model reasoning for this score</figcaption>
+        </figure>
+        <!-- Evidence disclosure for the Access Score; populated when spans present. -->
+        <div class="score-evidence-slot"></div>
+      </section>
+
+      <!-- BARRIER PROFILE -->
+      <section class="barriers-section" aria-label="Restriction and barrier profile">
+        <h4 class="subgroup-title">Restriction &amp; barrier profile</h4>
+        <div class="barrier-chips"></div>
+      </section>
+
+      <!-- PARAMETER CARDS -->
+      <div class="param-groups">
+        <section class="param-group">
+          <h4 class="group-title"><span class="group-badge">Eligibility</span></h4>
+          <div class="cards cards-eligibility"></div>
+        </section>
+
+        <section class="param-group">
+          <h4 class="group-title"><span class="group-badge badge-amber">Step therapy</span></h4>
+          <div class="cards cards-step"></div>
+          <div class="long-field">
+            <div class="long-field-head">
+              <span class="long-field-label">Step therapy requirements documented in policy</span>
+              <span class="long-field-conf step-requirements-conf"></span>
+            </div>
+            <p class="long-field-text step-requirements-text"></p>
+            <div class="step-requirements-evidence"></div>
+          </div>
+        </section>
+
+        <section class="param-group">
+          <h4 class="group-title"><span class="group-badge badge-blue">Utilization management</span></h4>
+          <div class="cards cards-um"></div>
+          <div class="long-field">
+            <div class="long-field-head">
+              <span class="long-field-label">Reauthorization requirements documented in policy</span>
+              <span class="long-field-conf reauth-requirements-conf"></span>
+            </div>
+            <p class="long-field-text reauth-requirements-text"></p>
+            <div class="reauth-requirements-evidence"></div>
+          </div>
+        </section>
+      </div>
+
+      <!-- META STRIP -->
+      <section class="meta-panel" aria-label="Pipeline detail">
+        <h4 class="subgroup-title">Pipeline detail</h4>
+        <div class="meta-top">
+          <span class="meta-source pill"></span>
+          <span class="meta-model pill pill-ghost"></span>
+        </div>
+        <div class="meta-stats stat-row"></div>
+
+        <details class="policy-text">
+          <summary>Show the focused source text the model read</summary>
+          <pre class="policy-pre policy-text-pre" tabindex="0"></pre>
+        </details>
+
+        <div class="json-actions">
+          <button type="button" class="btn btn-ghost btn-sm copy-json">Copy JSON</button>
+          <button type="button" class="btn btn-ghost btn-sm download-json">Download JSON</button>
+          <span class="copy-status" aria-live="polite"></span>
+        </div>
+      </section>
+    </article>
+  </template>
+
+  <footer class="app-footer wrap">
+    <p class="subtle">Static dashboard served by a Cloudflare Worker &middot; analyses computed by a CPU Docling + DeepSeek v4-pro container that OCRs each PDF once and streams per-brand results. All analytics on this page are derived client-side from the returned policy fields.</p>
+  </footer>
+
+  <script src="/app.js" defer></script>
+  <script src="/batch.js" defer></script>
+  <script src="/library.js" defer></script>
+  <script src="/analytics.js" defer></script>
+  <script src="/export.js" defer></script>
+  <script src="/cohorts.js" defer></script>
+</body>
+</html>

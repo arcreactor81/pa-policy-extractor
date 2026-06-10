@@ -1,0 +1,171 @@
+{
+  // pa-policy-extractor — Cloudflare Worker fronting a Cloudflare Container.
+  "name": "pa-policy-extractor",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-01",
+
+  // The container running the Python extraction pipeline. standard-4 =
+  // 4 vCPU / 12 GiB / 20 GB disk — chosen for CPU OCR headroom.
+  "containers": [
+    {
+      "class_name": "PaContainer",
+      "image": "./container/Dockerfile",
+      "image_build_context": "./container",
+      "instance_type": "standard-4",
+      // Sticky-per-PDF routing fans distinct PDFs out across instances; capped
+      // at 3 to bound worst-case concurrent containers (cost).
+      "max_instances": 3
+    }
+  ],
+
+  // Durable Object bindings:
+  //   PA_CONTAINER    — the Worker's handle to the container class.
+  //   RATE_LIMITER    — the per-IP sliding-window rate limiter DO.
+  //   JOB_COORDINATOR — the per-job async/batch coordinator DO (Layer 3).
+  "durable_objects": {
+    "bindings": [
+      { "name": "PA_CONTAINER", "class_name": "PaContainer" },
+      { "name": "RATE_LIMITER", "class_name": "RateLimiter" },
+      { "name": "JOB_COORDINATOR", "class_name": "JobCoordinator" }
+    ]
+  },
+
+  // Durable Object migrations. v1 registered the container class; v2 added the
+  // SQLite-backed RateLimiter; v3 adds the SQLite-backed JobCoordinator. Each is
+  // a NEW tag — existing v1/v2 tags are untouched so deployed state is preserved.
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["PaContainer"] },
+    { "tag": "v2", "new_sqlite_classes": ["RateLimiter"] },
+    { "tag": "v3", "new_sqlite_classes": ["JobCoordinator"] }
+  ],
+
+  // R2 bucket for Layer 3: staged uploads (pdfs/<jobId>/<i>.pdf) and finished
+  // aggregated results (results/<jobId>.json). The JobCoordinator writes/reads
+  // here; the retention alarm deletes per-job objects after RETENTION_DAYS.
+  // ALSO holds the persistent-library full result JSON (results/lib/<id>.json),
+  // whose lean index lives in the LIBRARY D1 database below.
+  "r2_buckets": [
+    { "binding": "RESULT_BUCKET", "bucket_name": "pa-job-results" }
+  ],
+
+  // D1 database backing the persistent, queryable analysis library (table
+  // `analyses`). The schema is applied LAZILY at runtime via CREATE TABLE IF NOT
+  // EXISTS (see src/library.ts → ensureLibrarySchema), so there is NO local
+  // `wrangler d1 migrations` step.
+  //
+  // OPERATOR SETUP: the "pa-library" D1 database and "pa-job-results" R2 bucket
+  // are already provisioned in this account (created 2026-06-10). FORKS deploying
+  // to a different account must create both (dashboard or `wrangler d1 create
+  // pa-library` / `wrangler r2 bucket create pa-job-results`) and replace the
+  // `database_id` below. Both D1 and R2 are on the Workers Paid included tiers,
+  // so this stays subscription-bounded.
+  "d1_databases": [
+    {
+      "binding": "LIBRARY",
+      "database_name": "pa-library",
+      "database_id": "00000000-0000-0000-0000-000000000000"
+    }
+  ],
+
+  // Static UI in ./public. run_worker_first=true sends EVERY request through the
+  // Worker first, so the Worker can wrap asset responses (the main HTML document,
+  // app.js, theme.js, styles.css, favicon, SPA fallback) with the CSP + security
+  // headers via env.ASSETS.fetch + withSecurityHeaders (src/index.ts). A
+  // selective ["/api/*"] route would bypass the Worker for assets and ship the
+  // document with NO Content-Security-Policy. SPA fallback to index.html is
+  // still handled by the Assets server when the Worker calls env.ASSETS.fetch.
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": true
+  },
+
+  // Plain (non-secret) vars forwarded into the container by the Worker.
+  // DEEPSEEK_API_KEY, CF_AIG_TOKEN and CF_API_TOKEN are SECRETS — set via
+  // `wrangler secret put` (or the dashboard), never committed here.
+  "vars": {
+    // CF_AIG_ACCOUNT_ID: the Cloudflare account id. Used for the AI Gateway, and
+    // ALSO required for the W3 multi-model consensus secondary base URL (Workers AI)
+    // — not only the AI Gateway. Leave "" to disable both.
+    "CF_AIG_ACCOUNT_ID": "",
+    "CF_AIG_GATEWAY_ID": "",
+    "DEEPSEEK_MODEL": "deepseek-v4-pro",
+    "DEEPSEEK_THINKING": "on",
+    "DEEPSEEK_REASONING_EFFORT": "high",
+
+    // W3 (optional multi-model consensus) — the legacy SECONDARY cross-check
+    // model id, used ONLY when VALIDATOR_MODELS is unset (it isn't — see below),
+    // so this is inert today. Kept for backward compat; matches the first
+    // VALIDATOR_MODELS entry. Its account token CF_API_TOKEN is a dashboard
+    // SECRET (NOT a var here); consensus no-ops when CF_API_TOKEN is absent.
+    "SECONDARY_MODEL": "@cf/openai/gpt-oss-20b",
+
+    // W3-ext (3-model consensus) — the LIST of Workers AI VALIDATOR models (CSV
+    // of @cf/ ids) the container runs alongside canonical DeepSeek when a request
+    // opts into consensus ("consensus" form field; off by default). Each
+    // validator reuses CF_API_TOKEN (dashboard SECRET) + CF_AIG_ACCOUNT_ID.
+    // Degrades gracefully (fewer/no validators) if the token is unset or a
+    // validator errors. Supported on BOTH the interactive and batch paths (the
+    // JobCoordinator forwards the job's `consensus` flag per PDF).
+    // Model choice (researched 2026-06): both have 128k context on Workers AI
+    // (policy docs reach ~75k tokens; Workers AI HARD-ERRORS on oversized input)
+    // and top-tier JSON-mode reliability. The previous defaults were unfit:
+    // llama-3.3-70b-fp8-fast is 24k-ctx on Workers AI and gemma-3-12b was
+    // deprecated 2026-05-30. Cheap fallback (small docs only, 32.7k ctx):
+    // @cf/qwen/qwen3-30b-a3b-fp8.
+    "VALIDATOR_MODELS": "@cf/openai/gpt-oss-20b,@cf/mistralai/mistral-small-3.1-24b-instruct",
+
+    // #4 (deploy): the documented, configurable per-PDF LLM-call budget. Forwarded
+    // to the container (container/app.py reads MAX_LLM_CALLS) AND mirrored by the
+    // Worker's up-front job budget check so a job is rejected before staging work.
+    // 200 fits the worst legal request: 15 brands × (2×3 deep runs + 1 spans +
+    // 2 validators × 3 runs) = 195 calls.
+    "MAX_LLM_CALLS": "200",
+
+    // Accuracy-pipeline tunables (forwarded to the container; defaults match the
+    // in-code constants). CONFIDENCE_RUNS: applies when `runs` is omitted — kept
+    // at "1" so interactive uploads stay fast/cheap (the UI's Deep-Confidence
+    // toggle sends runs=3 explicitly; batch jobs also send runs explicitly).
+    // REDUCER_PASSTHROUGH_CHARS / SCORING_MAX_CHARS: override-layer thresholds
+    // (reducer passthrough gate; LLM input truncation matching the validated original).
+    "CONFIDENCE_RUNS": "1",
+    "REDUCER_PASSTHROUGH_CHARS": "100000",
+    "SCORING_MAX_CHARS": "300000",
+
+    // Layer 3 (async/batch jobs) — subscription-bounded caps:
+    //   MAX_PDFS_PER_JOB    — hard cap on PDFs per job.
+    //   MAX_CONCURRENT_PDFS — in-flight PDFs per job (<= container max_instances=3).
+    //   RETENTION_DAYS      — auto-delete a job's R2 objects + DO storage after N days.
+    "MAX_PDFS_PER_JOB": "25",
+    "MAX_CONCURRENT_PDFS": "2",
+    "RETENTION_DAYS": "7",
+
+    // #3 (cost): persistent-library retention. The daily scheduled() cron prunes
+    // `analyses` rows (and their R2 results/lib/<id>.json) older than this many
+    // days, bounded per run, so the library cannot grow unbounded. Default 30.
+    "LIBRARY_RETENTION_DAYS": "30"
+
+    // Opt-in tenant isolation (security fix #2) — UNSET by default. To verify
+    // identity via signed Cloudflare Access JWTs instead of trusting the
+    // spoofable cf-access-authenticated-user-email header, set BOTH of these
+    // (then a missing/invalid Cf-Access-Jwt-Assertion is rejected with 401):
+    //   "ACCESS_TEAM_DOMAIN": "<team>.cloudflareaccess.com",
+    //   "ACCESS_AUD": "<your Access Application AUD tag>"
+    // While unset, tenant isolation REQUIRES Cloudflare Access enforcement on the
+    // route (otherwise the identity header is spoofable).
+  },
+
+  // W5 (saved cohorts) — budget-safe daily cron. The Worker's scheduled() handler
+  // re-runs ONLY cohorts that opted in (schedule_enabled=1). With nothing opted
+  // in it is an INERT, near-zero-cost daily D1 check (one indexed SELECT that
+  // returns no rows — no container is woken, no job is created). COST: each
+  // scheduled cohort that DOES run stages its PDFs into a new batch job and so
+  // spends container vCPU-minutes (same cost as a manual "Run now"); this is why
+  // the per-cohort toggle is OFF by default. Cron runs at 06:00 UTC daily.
+  "triggers": {
+    "crons": ["0 6 * * *"]
+  },
+
+  "observability": { "enabled": true }
+}

@@ -1,0 +1,69 @@
+# Generate package-lock.json in the cloud — RUN THIS ONCE, MANUALLY.
+#
+# WHY: this repo ships no package-lock.json, so ci.yml/deploy.yml fall back to
+# `npm install` (resolves versions fresh on every run — a supply-chain weakness:
+# no integrity hashes, no pinned transitive tree). The author cannot run npm on
+# their (slow) local machine, so we generate the lockfile on a GitHub runner.
+#
+# HOW TO USE (the author runs this exactly once):
+#   1. Go to the repo's "Actions" tab.
+#   2. Pick the "gen-lockfile" workflow in the left sidebar.
+#   3. Click "Run workflow" (uses the default branch, or pick another).
+#   4. The job runs `npm install --package-lock-only` and commits the resulting
+#      package-lock.json straight back to the branch it ran on.
+#
+# AFTER THAT: a package-lock.json exists in the repo, so ci.yml and deploy.yml
+# automatically switch from `npm install` to `npm ci` (reproducible,
+# integrity-pinned installs). No further manual steps — and you can delete this
+# workflow if you like, or re-run it whenever package.json changes and you want
+# to refresh the lockfile.
+#
+# SAFETY: manual trigger only (workflow_dispatch — never runs on push/PR), and a
+# least-privilege token (permissions: contents: write, nothing else).
+name: gen-lockfile
+
+on:
+  workflow_dispatch:
+
+# Least privilege: only the permission needed to push the lockfile commit.
+permissions:
+  contents: write
+
+# Don't let two manual runs race to commit the lockfile.
+concurrency:
+  group: gen-lockfile-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gen-lockfile:
+    name: generate + commit package-lock.json
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Generate package-lock.json (metadata only, no node_modules)
+        # --package-lock-only resolves the full dependency tree and writes the
+        # lockfile WITHOUT downloading/installing packages into node_modules —
+        # fast, and all we need to commit.
+        run: npm install --package-lock-only
+
+      - name: Commit and push the lockfile
+        # Uses the workflow's GITHUB_TOKEN (scoped by `permissions: contents:
+        # write` above). If package-lock.json is unchanged, exit cleanly without
+        # an empty commit.
+        run: |
+          if git diff --quiet -- package-lock.json; then
+            echo "package-lock.json is already up to date — nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package-lock.json
+          git commit -m "chore: add committed package-lock.json (enables 'npm ci' in CI/deploy)"
+          git push

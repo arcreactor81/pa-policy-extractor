@@ -1,0 +1,23 @@
+# .dev.vars.example — copy to `.dev.vars` and fill in real values for local
+# `wrangler dev`. NOTE: `.dev.vars` is gitignored; never commit real secrets.
+# In production, secrets (DEEPSEEK_API_KEY, CF_AIG_TOKEN) go via
+# `wrangler secret put`, NOT this file.
+
+# DeepSeek API key (Bearer token). Required. Keep this secret.
+DEEPSEEK_API_KEY="sk-..."
+
+# Cloudflare AI Gateway routing (optional). Leave both blank to call
+# https://api.deepseek.com directly. Set both to route DeepSeek through your
+# gateway:
+#   https://gateway.ai.cloudflare.com/v1/<CF_AIG_ACCOUNT_ID>/<CF_AIG_GATEWAY_ID>/deepseek
+CF_AIG_ACCOUNT_ID=""
+CF_AIG_GATEWAY_ID=""
+
+# Uncomment ONLY if your AI Gateway is configured as "authenticated".
+# Sent as `cf-aig-authorization: Bearer <token>`. Keep this secret.
+# CF_AIG_TOKEN=""
+
+# Model + reasoning configuration (plain vars).
+DEEPSEEK_MODEL="deepseek-v4-pro"
+DEEPSEEK_THINKING="on"
+DEEPSEEK_REASONING_EFFORT="high"

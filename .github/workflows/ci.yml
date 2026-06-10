@@ -1,0 +1,138 @@
+# CI — the REAL validation gate. Nothing in this project runs on the author's
+# (slow) local machine; correctness is proven here, in the cloud, on every push
+# and pull request.
+#
+# Three jobs:
+#   * python — installs ONLY light test deps (pytest + the pure-Python bits) and
+#     runs the container test suite. It deliberately does NOT install
+#     torch / docling / surya / transformers / google-genai: the suite stubs those
+#     heavy modules (see container/tests/conftest.py) and only exercises the
+#     verbatim notebook validators + the pure-Python aggregation/explain logic.
+#   * node — installs the Worker toolchain, typechecks the TypeScript contract,
+#     and runs the Worker vitest suite in the workers runtime.
+#   * real-stack-weekly — the heavy counterpart of `python`: installs the REAL
+#     torch/docling/surya stack (pinned by container/constraints.txt) and runs
+#     the suite UNstubbed, including the docling-gated converter test. Far too
+#     slow for every push, so it only runs on the weekly schedule + manual
+#     dispatch (see its job-level `if`).
+name: ci
+
+on:
+  push:
+  pull_request:
+  # Weekly real-stack run (Mondays 05:00 UTC). The schedule exists solely for
+  # the real-stack-weekly job; the fast jobs also run on it, which is cheap and
+  # gives a free weekly canary that the light gate itself still passes.
+  schedule:
+    - cron: "0 5 * * 1"
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: python (container tests)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install light test deps only (NO torch/docling/surya)
+        # pytest drives the suite; requests is the only third-party module
+        # pipeline.llm imports at module scope. Every heavy dep (torch, docling,
+        # docling-surya, surya-ocr, transformers, google-genai, openpyxl) is
+        # stubbed in container/tests/conftest.py, so we must NOT install them —
+        # that is the whole point of running the gate cheaply in the cloud.
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest requests
+
+      - name: Run container tests
+        run: pytest container/tests -v
+
+  node:
+    name: node (worker typecheck + vitest)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        # Prefer `npm ci` (reproducible, lockfile-pinned). Until a
+        # package-lock.json is committed, fall back to `npm install` so the gate
+        # still runs — `npm ci` requires a lockfile and would otherwise fail.
+        # Commit the lockfile once and CI uses `npm ci` automatically thereafter.
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            echo "no package-lock.json found — falling back to 'npm install' (commit the lockfile to enable 'npm ci')"
+            npm install
+          fi
+
+      - name: Typecheck (TypeScript contract)
+        run: npm run typecheck
+
+      - name: Worker tests (vitest)
+        run: npm test
+
+  real-stack-weekly:
+    name: python (REAL stack, weekly)
+    # The fast `python` job above stubs every heavy dep, so by construction it
+    # cannot catch drift between the stubs and the real packages (e.g. a docling
+    # or transformers release that breaks the converter wiring). This job
+    # installs the REAL stack and runs the FULL suite with NO stubs active
+    # (conftest.py only stubs modules that are absent), which un-skips the
+    # @pytest.mark.docling converter test. Too heavy for every push — the
+    # job-level `if` restricts it to the weekly schedule + manual dispatch.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the REAL python stack (CPU torch + docling + surya)
+        # Mirrors container/Dockerfile: the CPU torch wheel first (no GPU on the
+        # runner; the CUDA wheels would blow the disk budget), then the full
+        # requirements — version-locked by container/constraints.txt, which the
+        # gen-pylock workflow generates. Until that file is committed, fall back
+        # to an unpinned resolve (same pattern as the package-lock.json fallback
+        # in the node job above).
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f container/constraints.txt ]; then
+            pip install torch --index-url https://download.pytorch.org/whl/cpu -c container/constraints.txt
+            pip install -r container/requirements.txt -c container/constraints.txt
+          else
+            echo "no container/constraints.txt found — falling back to an unpinned resolve (run the gen-pylock workflow to create it)"
+            pip install torch --index-url https://download.pytorch.org/whl/cpu
+            pip install -r container/requirements.txt
+          fi
+          pip install pytest
+
+      - name: Run container tests against the real stack (no stubs)
+        # Same suite as the fast job, but with the real deps importable the
+        # conftest stubs are inert and the docling-gated test actually runs.
+        run: pytest container/tests -v

@@ -1,0 +1,14 @@
+# Build-context hygiene. The runtime image needs app.py, warmup_build.py,
+# requirements.txt, pipeline/ and notebooks/ (the AST loader reads the .ipynb
+# files verbatim) — so none of those are excluded here.
+__pycache__/
+*.pyc
+*.pyo
+.cache/
+.pytest_cache/
+tests/
+*.md
+*.log
+.git/
+.gitignore
+.DS_Store

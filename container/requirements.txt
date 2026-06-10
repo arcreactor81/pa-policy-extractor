@@ -1,0 +1,48 @@
+# PA policy extraction — container dependencies (Python 3.12+).
+#
+# SOURCE OF TRUTH: the GitHub Actions build. Cloudflare performs no server-side
+# Dockerfile build, so whatever pip resolves on the Actions runner is what ships.
+# These guards aim for reproducibility WITHOUT over-pinning versions we cannot
+# verify here (over-pinning risks an unsatisfiable resolve at build time).
+# constraints.txt (passed as `-c constraints.txt` by the Dockerfile) narrows the
+# remaining float with verified pins — see the notes there.
+#
+# Stage 1 (PDF -> markdown + DoclingDocument) uses Docling + Surya OCR on CPU.
+#
+# transformers is HARD-PINNED: newer releases break Surya OCR text recognition
+# ('SuryaDecoderConfig' object has no attribute 'pad_token_id'). Listed first so
+# pip resolves the constraint before docling/docling-surya. DO NOT bump without
+# re-validating the OCR recognition path end-to-end in CI.
+transformers==4.57.3
+
+# Docling stack. Left unpinned so pip can satisfy them against the transformers
+# pin above; an aggressive upper bound here tends to make the resolve fail.
+# Bound docling only loosely to avoid a future major that drops the pipeline
+# options (ThreadedPdfPipelineOptions / TableStructureOptions) core.py relies on.
+docling<3
+docling-core
+docling-surya
+surya-ocr
+
+# Deep-learning backend. The Dockerfile installs the CPU build of torch FIRST
+# (Cloudflare Containers have no GPU); this line just records the dependency so
+# the resolver keeps the already-installed CPU wheel. Unpinned on purpose —
+# pinning a version absent from the CPU wheel index would break the build.
+torch
+
+# Steps 3 & 4 call DeepSeek v4-pro over HTTPS (OpenAI-compatible).
+requests
+
+# google-genai is installed ONLY so the original notebook cells import cleanly
+# when the loader picks up their verbatim prompts/validators. It is never called
+# — all inference goes to DeepSeek via pipeline/llm.py. See pipeline/core.py.
+google-genai
+
+# Tabular helper used by the reducer (table -> dataframe) and notebooks.
+pandas
+openpyxl
+
+# HTTP server. Flask provides the app; waitress is the production WSGI server
+# (app.py falls back to Flask's dev server only if waitress is missing).
+flask
+waitress

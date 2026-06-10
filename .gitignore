@@ -1,0 +1,26 @@
+# Node / build
+node_modules/
+dist/
+*.log
+
+# Wrangler
+.wrangler/
+
+# Local secrets (real secrets go via `wrangler secret put`)
+.dev.vars
+.dev.vars.*
+# ...but the placeholder template MUST ship (the README's local-dev step copies it)
+!.dev.vars.example
+
+# OS cruft
+.DS_Store
+
+# Python (container)
+container/.cache/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Local policy PDFs — NEVER commit policy documents
+pdfs/
+/*.pdf
