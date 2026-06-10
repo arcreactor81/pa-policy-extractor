@@ -363,10 +363,13 @@ async function handleCreateJob(env: Env, request: Request): Promise<Response> {
     return json({ error: "expected multipart/form-data body" } satisfies ErrorResponse, 400);
   }
 
-  // Collect uploaded files (field "file", possibly repeated).
-  const files = form
-    .getAll("file")
-    .filter((f): f is File => f instanceof File && f.size > 0);
+  // Collect uploaded files (field "file", possibly repeated). NOTE: workers-types
+  // mis-types FormData.getAll() as string[] (workerd#3178) even though the runtime
+  // returns File objects (formdata_parser_supports_files, on by default). Cast to
+  // the real (File | string)[] so the instanceof narrowing typechecks.
+  const files = (form.getAll("file") as (File | string)[]).filter(
+    (f): f is File => f instanceof File && f.size > 0
+  );
   if (files.length === 0) {
     return json({ error: "no PDFs uploaded under field 'file'" } satisfies ErrorResponse, 400);
   }
@@ -413,9 +416,12 @@ async function handleCreateJob(env: Env, request: Request): Promise<Response> {
   // Per-file size guard + PDF magic-byte check; stage each PDF in R2.
   const jobId = crypto.randomUUID();
   const pdfs: { index: number; filename: string }[] = [];
+  // Sequential, not Promise.all: each iteration's `bytes` is loop-scoped and
+  // eligible for GC before the next file is read, so only one ~20MB buffer is
+  // live at a time — keeping us clear of the 128MB isolate limit on big batches.
   for (let i = 0; i < files.length; i++) {
     const file = files[i];
-    let bytes: ArrayBuffer | null = await file.arrayBuffer();
+    const bytes = await file.arrayBuffer();
     if (bytes.byteLength > MAX_UPLOAD_BYTES) {
       return json(
         {
@@ -437,9 +443,6 @@ async function handleCreateJob(env: Env, request: Request): Promise<Response> {
     await env.RESULT_BUCKET.put(`pdfs/${jobId}/${i}.pdf`, bytes, {
       httpMetadata: { contentType: "application/pdf" },
     });
-    // Release the buffer reference promptly: with many ~20MB files in one job,
-    // keeping every prior file's copy alive pressures the 128MB isolate limit.
-    bytes = null;
     pdfs.push({ index: i, filename: file.name || `upload-${i}.pdf` });
   }
 

@@ -827,7 +827,8 @@ async function loadRunResults(
     } catch {
       continue;
     }
-    const rr = doc?.result as Record<string, unknown> | undefined;
+    // doc.result is a typed ResultRow (no index signature); widen via unknown.
+    const rr = doc?.result as unknown as Record<string, unknown> | undefined;
     if (rr && typeof rr === "object") {
       out.set(key, rr);
     }

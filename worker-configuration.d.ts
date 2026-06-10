@@ -5,8 +5,13 @@
  * Cloudflare-provided types with `npm run cf-typegen` (wrangler types).
  */
 export interface Env {
-  /** Durable Object namespace backing the PaContainer container. */
-  PA_CONTAINER: DurableObjectNamespace;
+  /**
+   * Durable Object namespace backing the PaContainer container. Typed with the
+   * concrete class so `getContainer(env.PA_CONTAINER, ...)` from
+   * @cloudflare/containers (which requires DurableObjectNamespace<Container>)
+   * accepts it. The type-only import avoids a runtime dependency.
+   */
+  PA_CONTAINER: DurableObjectNamespace<import("./src/index").PaContainer>;
 
   /** Durable Object namespace backing the per-IP RateLimiter. */
   RATE_LIMITER: DurableObjectNamespace;

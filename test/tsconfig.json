@@ -1,0 +1,12 @@
+{
+  // Type config for the Worker test suite. The `cloudflare:test` virtual module
+  // and the `@cloudflare/vitest-pool-workers/config` entrypoint resolve under
+  // vitest's loader at `npm test` time; this tsconfig gives editors/local tsc
+  // the same types. It is intentionally NOT part of the deploy-gate typecheck
+  // (tsconfig.json), which covers only the deployable src.
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "types": ["@cloudflare/workers-types", "@cloudflare/vitest-pool-workers"]
+  },
+  "include": ["./**/*.ts", "../vitest.config.ts", "../src/**/*.ts", "../worker-configuration.d.ts"]
+}
