@@ -42,10 +42,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Node 20
+      - name: Set up Node 22
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
 
       - name: Generate package-lock.json (metadata only, no node_modules)
         # --package-lock-only resolves the full dependency tree and writes the
@@ -56,9 +56,12 @@ jobs:
       - name: Commit and push the lockfile
         # Uses the workflow's GITHUB_TOKEN (scoped by `permissions: contents:
         # write` above). If package-lock.json is unchanged, exit cleanly without
-        # an empty commit.
+        # an empty commit. NOTE: `git status --porcelain`, not `git diff` — on
+        # the FIRST run the lockfile is UNTRACKED and `git diff --quiet` is
+        # blind to untracked files (it would exit 0 and silently skip the only
+        # commit that matters).
         run: |
-          if git diff --quiet -- package-lock.json; then
+          if [ -z "$(git status --porcelain -- package-lock.json)" ]; then
             echo "package-lock.json is already up to date — nothing to commit."
             exit 0
           fi

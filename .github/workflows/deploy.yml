@@ -66,10 +66,10 @@ jobs:
           # checkout falls back to the ref the dispatch was run on.
           ref: ${{ github.event.workflow_run.head_sha }}
 
-      - name: Set up Node 20
+      - name: Set up Node 22
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
 
       - name: Install dependencies
         # `npm ci` once a lockfile is committed; fall back to `npm install` until
@@ -111,4 +111,8 @@ jobs:
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # Pin wrangler 4: the action's bundled default is wrangler 3.x, which
+          # cannot read wrangler.jsonc / the containers config ("Missing
+          # entry-point") and would ignore the project's own devDependency.
+          wranglerVersion: "4.99.0"
           command: deploy

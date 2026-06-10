@@ -342,7 +342,7 @@
     var consensus = !!(consensusToggle && consensusToggle.checked);
     if (deep) form.append("runs", String(DEEP_RUNS));
     form.append("explain", quotes ? "true" : "false");
-    // W3 cross-check (off by default), sent as "1"/"0" like the single flow.
+    // W3 cross-check (toggle ships CHECKED — on by default), sent as "1"/"0" like the single flow.
     // The Worker forwards it through the JobCoordinator to the container per
     // PDF, so batch results carry the same per-field `consensus` maps as the
     // single flow (rendered by the shared brand-card renderer) when toggled on.

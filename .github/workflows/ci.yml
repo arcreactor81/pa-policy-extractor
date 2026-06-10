@@ -68,10 +68,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Node 20
+      - name: Set up Node 22
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
 
       - name: Install dependencies
         # Prefer `npm ci` (reproducible, lockfile-pinned). Until a
@@ -88,6 +88,13 @@ jobs:
 
       - name: Typecheck (TypeScript contract)
         run: npm run typecheck
+
+      - name: Typecheck (test suite)
+        # The deploy-gate tsconfig deliberately excludes test/ (the
+        # cloudflare:test virtual module only resolves under vitest); this
+        # separate project covers the test files so they can't type-rot —
+        # vitest transpiles without checking.
+        run: npm run typecheck:test
 
       - name: Worker tests (vitest)
         run: npm test

@@ -92,7 +92,7 @@ const MAX_JOB_UPLOAD_BYTES = 100 * 1024 * 1024;
 
 /**
  * Layer 3 LLM-call budget per PDF — the Worker's up-front mirror of the
- * container's configurable MAX_LLM_CALLS (#4: default "50"). A job submission is
+ * container's configurable MAX_LLM_CALLS (#4: default "200"). A job submission is
  * rejected up front if any PDF would exceed it, so we never stage work the
  * container will refuse: brands * (2*runs + (explain ? 1 : 0) + validators*runs),
  * where `validators` is non-zero only when the job opts into W3-ext consensus

@@ -10,5 +10,12 @@
     // (the package's root types are the pool API, not the test globals).
     "types": ["@cloudflare/workers-types", "@cloudflare/vitest-pool-workers/types"]
   },
-  "include": ["./**/*.ts", "../vitest.config.mts", "../src/**/*.ts", "../worker-configuration.d.ts"]
+  // Override the inherited root exclude: the root tsconfig excludes "test" and
+  // "vitest.config.mts" (so the deploy-gate typecheck skips them), but THIS
+  // config exists to check exactly those test files — without this override,
+  // `tsc -p test` passes vacuously on zero files. vitest.config.mts stays out:
+  // its vitest/config import graph needs @types/node, which we don't ship; the
+  // config file is execute-verified by `npm test` itself.
+  "exclude": ["../node_modules"],
+  "include": ["./**/*.ts", "../src/**/*.ts", "../worker-configuration.d.ts"]
 }

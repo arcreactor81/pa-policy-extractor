@@ -165,7 +165,7 @@ All `/api/library` and `/api/cohorts` routes are **tenant-scoped** to the caller
      // CF_API_TOKEN *secret* (below) is what actually turns it on — without it,
      // consensus silently no-ops.
      "VALIDATOR_MODELS": "@cf/openai/gpt-oss-20b,@cf/mistralai/mistral-small-3.1-24b-instruct",
-     "SECONDARY_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+     "SECONDARY_MODEL": "@cf/openai/gpt-oss-20b",
 
      // tunable cost / throughput knobs (defaults shown — fine to leave as-is)
      "MAX_LLM_CALLS": "200",           // per-request LLM-call budget (fits the worst legal request: 15 brands x (2x3 deep runs + 1 spans + 2 validators x 3 runs) = 195)
