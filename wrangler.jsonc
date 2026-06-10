@@ -87,9 +87,11 @@
   "vars": {
     // CF_AIG_ACCOUNT_ID: the Cloudflare account id. Used for the AI Gateway, and
     // ALSO required for the W3 multi-model consensus secondary base URL (Workers AI)
-    // — not only the AI Gateway. Leave "" to disable both.
-    "CF_AIG_ACCOUNT_ID": "",
-    "CF_AIG_GATEWAY_ID": "",
+    // — not only the AI Gateway. Leave "" to disable both. With BOTH set, the
+    // DeepSeek primary AND the Workers AI validators route through the gateway
+    // "firstgateway", so its budget/spend cap governs all LLM traffic.
+    "CF_AIG_ACCOUNT_ID": "<account-id>",
+    "CF_AIG_GATEWAY_ID": "firstgateway",
     "DEEPSEEK_MODEL": "deepseek-v4-pro",
     "DEEPSEEK_THINKING": "on",
     "DEEPSEEK_REASONING_EFFORT": "high",
