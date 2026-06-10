@@ -10,5 +10,5 @@
     // (the package's root types are the pool API, not the test globals).
     "types": ["@cloudflare/workers-types", "@cloudflare/vitest-pool-workers/types"]
   },
-  "include": ["./**/*.ts", "../vitest.config.ts", "../src/**/*.ts", "../worker-configuration.d.ts"]
+  "include": ["./**/*.ts", "../vitest.config.mts", "../src/**/*.ts", "../worker-configuration.d.ts"]
 }

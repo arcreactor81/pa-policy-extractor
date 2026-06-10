@@ -15,10 +15,11 @@
     "allowJs": false
   },
   // The deploy-gate typecheck (`npm run typecheck`) covers the deployable Worker
-  // source only. The test files + vitest.config.ts pull in the
+  // source only. The test files + vitest.config.mts pull in the
   // @cloudflare/vitest-pool-workers types and the `cloudflare:test` virtual
   // module, which only resolve under vitest's own loader — they live in
   // test/tsconfig.json and are exercised by `npm test` (vitest), not tsc.
+  // (.mts because the pool package is ESM-only and this package is CJS-default.)
   "include": ["src/**/*.ts", "worker-configuration.d.ts"],
-  "exclude": ["node_modules", "container", "test", "vitest.config.ts"]
+  "exclude": ["node_modules", "container", "test", "vitest.config.mts"]
 }
