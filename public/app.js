@@ -16,17 +16,17 @@
   ];
 
   var SCORE_STOPS = [0, 25, 50, 75, 100];
-  // Punchy bucket palette: 0 rose, 25 orange, 50 amber, 75 green, 100 emerald.
-  // Mirrors the --stop-* CSS custom properties.
-  // `fg` is the chip text color: dark ink #1a1530 clears WCAG AA (>=4.5:1) on
-  // every bucket fill (rose 4.79, orange 7.77, amber 8.19, green 7.72, emerald
-  // 6.93); plain white fails AA on all of them (2.15–3.67), so it is not used.
+  // Dusty pastel bucket palette: 0 dusty red, 25 terracotta, 50 muted gold,
+  // 75 light sage, 100 deep sage. Mirrors the --stop-* CSS custom properties.
+  // `fg` is the chip text color: dark ink #232220 clears WCAG AA (>=4.5:1) on
+  // every bucket fill (dusty red 5.2, terracotta 7.0, gold 7.5, light sage 6.5,
+  // deep sage 4.9); plain white fails AA on all of them, so it is not used.
   var SCORE_META = {
-    0:   { label: "Not covered",   color: "#f43f5e", fg: "#1a1530", meaning: "Not covered for plaque psoriasis." },
-    25:  { label: "Restricted",    color: "#fb923c", fg: "#1a1530", meaning: "Covered, but with hurdles beyond the FDA label." },
-    50:  { label: "Parity",        color: "#f59e0b", fg: "#1a1530", meaning: "Coverage at parity with the FDA label." },
-    75:  { label: "Preferred",     color: "#22c55e", fg: "#1a1530", meaning: "Preferred / broader than the FDA label." },
-    100: { label: "Open access",   color: "#10b981", fg: "#1a1530", meaning: "Fully open access — no PA / utilization management." }
+    0:   { label: "Not covered",   color: "#c97f7f", fg: "#232220", meaning: "Not covered for plaque psoriasis." },
+    25:  { label: "Restricted",    color: "#db9f74", fg: "#232220", meaning: "Covered, but with hurdles beyond the FDA label." },
+    50:  { label: "Parity",        color: "#cdb05e", fg: "#232220", meaning: "Coverage at parity with the FDA label." },
+    75:  { label: "Preferred",     color: "#8fae7f", fg: "#232220", meaning: "Preferred / broader than the FDA label." },
+    100: { label: "Open access",   color: "#6f9a64", fg: "#232220", meaning: "Fully open access — no PA / utilization management." }
   };
 
   // Confidence agreement thresholds: >=.8 high (green), .5-.8 mid (amber),
@@ -1441,7 +1441,9 @@
         lbl.setAttribute("x", cx); lbl.setAttribute("y", 10);
         lbl.setAttribute("text-anchor", "middle");
         lbl.setAttribute("font-size", "11"); lbl.setAttribute("font-weight", "700");
-        lbl.setAttribute("fill", meta.color);
+        // Plain ink, not meta.color: pastel stops are 2.1-3.2:1 as text on
+        // light glass; the colored pin/marker beside it carries the hue.
+        lbl.setAttribute("fill", "var(--text)");
         lbl.textContent = stop;
         svg.appendChild(lbl);
       }
@@ -1459,7 +1461,7 @@
       cap.setAttribute("x", cx); cap.setAttribute("y", trackY + trackH + 40);
       cap.setAttribute("text-anchor", "middle");
       cap.setAttribute("font-size", "9.5");
-      cap.setAttribute("fill", active ? meta.color : "var(--text-faint)");
+      cap.setAttribute("fill", active ? "var(--text)" : "var(--text-faint)");
       cap.setAttribute("font-weight", active ? "700" : "500");
       cap.textContent = meta.label;
       svg.appendChild(cap);
