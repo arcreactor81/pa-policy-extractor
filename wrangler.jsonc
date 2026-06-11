@@ -14,7 +14,15 @@
       "instance_type": "standard-4",
       // Sticky-per-PDF routing fans distinct PDFs out across instances; capped
       // at 3 to bound worst-case concurrent containers (cost).
-      "max_instances": 3
+      "max_instances": 3,
+      // Single-step rollouts: the default staged rollout ([10, 100]) left the
+      // OLD image serving most new instance starts for an indeterminate window
+      // after a successful deploy — observed live: a fixed image deployed green
+      // while fresh boots still ran the broken one. A 3-instance demo app gets
+      // no canary value from staging (Worker + container ship together), and
+      // automated post-deploy testing needs "deploy finished" to mean "new
+      // image serving". 100 = every instance updates in one step.
+      "rollout_step_percentage": 100
     }
   ],
 
