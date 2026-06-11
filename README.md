@@ -1,39 +1,43 @@
 # PA Policy Extractor
 
+![ci](https://github.com/arcreactor81/pa-policy-extractor/actions/workflows/ci.yml/badge.svg)
+
 A Cloudflare-hosted tool that reads a payer **Prior Authorization (PA) policy PDF** for a plaque-psoriasis (PsO) brand, OCRs it, and extracts a structured PA profile plus a 0–100 **Access Score**. A Cloudflare **Worker** serves the dashboard UI and a small JSON API; the heavy lifting (Docling + Surya OCR on CPU, a brand-focused text reducer, and DeepSeek v4-pro reasoning via Cloudflare AI Gateway) runs inside a Cloudflare **Container** that the Worker proxies to. It is a faithful re-host of an existing hackathon pipeline: the original notebooks are reused verbatim so the prompts and validators are byte-identical — the LLM call was swapped from Gemini to DeepSeek v4-pro, plus a small set of documented accuracy overrides (see the [Override layer](#override-layer-deliberate-divergences)).
+
+> Deep dive — original-vs-rehost change log, design decisions, and engineering process: [PROJECT_OVERVIEW.md](PROJECT_OVERVIEW.md).
 
 ## Architecture
 
 ```
-                                      ┌──────────────────────────────────────────┐
-                                      │            Cloudflare edge                │
+                                      ┌────────────────────────────────────────────┐
+                                      │            Cloudflare edge                 │
                                       │                                            │
-  ┌─────────┐   HTTPS                 │   ┌────────────────────┐                  │
-  │ Browser │ ───────────────────────────▶│  Worker (src/...)  │                  │
-  │  (UI)   │ ◀───────────────────────────│  • serves public/  │                  │
-  └─────────┘   dashboard + JSON      │   │  • proxies /api/*  │                  │
-                                      │   └─────────┬──────────┘                  │
+  ┌─────────┐   HTTPS                 │   ┌────────────────────┐                   │
+  │ Browser │ ───────────────────────────▶│  Worker (src/...)  │                   │
+  │  (UI)   │ ◀───────────────────────────│  • serves public/  │                   │
+  └─────────┘   dashboard + JSON      │   │  • proxies /api/*  │                   │
+                                      │   └─────────┬──────────┘                   │
                                       │             │ Durable Object               │
                                       │             │ binding PA_CONTAINER         │
                                       │             ▼                              │
-                                      │   ┌────────────────────────────────────┐  │
+                                      │   ┌─────────────────────────────────────┐  │
                                       │   │  Container "PaContainer" :8080      │  │
                                       │   │  Flask service (container/app.py)   │  │
-                                      │   │   1. Docling + Surya OCR (CPU)       │  │
+                                      │   │   1. Docling + Surya OCR (CPU)      │  │
                                       │   │   2. brand reducer  -> focused text │  │
                                       │   │   3. DeepSeek extraction (12 params)│  │
                                       │   │   4. DeepSeek access scoring        │  │
-                                      │   └───────────────┬────────────────────┘  │
-                                      └───────────────────┼───────────────────────┘
+                                      │   └───────────────┬─────────────────────┘  │
+                                      └───────────────────┼────────────────────────┘
                                                           │ HTTPS (OpenAI-compatible)
                                                           ▼
                                           ┌───────────────────────────────┐
-                                          │   Cloudflare AI Gateway        │
-                                          │   /deepseek/chat/completions   │
+                                          │   Cloudflare AI Gateway       │
+                                          │   /deepseek/chat/completions  │
                                           └───────────────┬───────────────┘
                                                           ▼
                                               ┌───────────────────────┐
-                                              │   DeepSeek v4-pro      │
+                                              │   DeepSeek v4-pro     │
                                               └───────────────────────┘
 ```
 
@@ -219,7 +223,7 @@ SECONDARY_MODEL                            # legacy single-validator id (compat)
 CONFIDENCE_RUNS                            # default extraction repeats when `runs` is omitted (default "1" — interactive fast path; Deep-Confidence/batch send runs=3 explicitly)
 REDUCER_PASSTHROUGH_CHARS                  # reducer full-document passthrough threshold (default "100000")
 SCORING_MAX_CHARS                          # policy-text cap for scoring + consensus validators (default "300000")
-PRIMARY_MAX_CHARS                          # policy-text guard for primary extraction/spans (default "3200000"; DeepSeek v4-pro has a 1M-token context)
+PRIMARY_MAX_CHARS                          # policy-text guard for primary extraction/spans (default "600000"; huge docs window-pack beyond it)
 ```
 
 `LIBRARY_RETENTION_DAYS` and `RETENTION_DAYS` are read by the **Worker** (D1/R2 pruning + batch cleanup), not the container, so they are not in this forwarded set.
@@ -254,6 +258,16 @@ npx wrangler dev                 # requires local Docker for the container
 
 `wrangler dev` reads `.dev.vars` for local secrets/vars. `.dev.vars` is **gitignored** — keep real keys out of version control. In production, secrets live on the Worker (dashboard or `wrangler secret put`), never in `.dev.vars`.
 
+### Running the test suites locally
+
+```bash
+npm install            # once
+npm run typecheck      # Worker TypeScript
+npm test               # Worker vitest suite (runs inside workerd)
+pip install pytest requests
+npm run test:py        # container suite (pytest container/tests; heavy deps auto-stubbed)
+```
+
 ## Fidelity note
 
 This is a re-host, not a rewrite. The original hackathon notebooks (`container/notebooks/*.ipynb`) are loaded **verbatim** through an AST notebook-loader (`container/pipeline/notebook_loader.py`), so the prompts (`SYSTEM_PROMPT`, `METHODOLOGY_PROMPT`), validators (`validate_and_normalize`, `consistency_check`), the reducer (`reduce_document`), and the CSV column mapping are byte-identical to the submission. The changes are the model call (`container/pipeline/llm.py`), swapped from Gemini to DeepSeek v4-pro, and the small override layer below. `google-genai` is still installed solely so those notebook cells **import** cleanly when the loader picks up their definitions — it is **never called**; all inference goes to DeepSeek.
@@ -265,7 +279,7 @@ The notebook files themselves are never edited — every accuracy fix is applied
 - **PsO regex case fix** — the reducer's bare `\bPsO\b` relevance pattern is case-sensitive in the original (unlike its `psoriasis` siblings), which makes it provably dead against the lowercased text the reducer strategies actually search; the override re-compiles it case-insensitively so `pso` matches.
 - **Two-sided relevance guard** — the reducer's output is now sanity-checked from the other side too: a reduced text that lacks the brand, a PsO keyword, or any criteria language is rejected in favour of the full document text (the fallback is observable in the result as `source: "relevance-fallback"`).
 - **Clamp → abstain** — the deterministic coverage-boundary check judges coverage over an **extended set of coverage fields** (the original's fields plus Age, Quantity Limits, and the Reauthorization columns), and an apparently-uncovered row with a positive model score is no longer clamped to 0: the model's score is preserved and the row is **flagged for review** (an all-NA extraction could equally be an extraction miss on a covered policy).
-- **Named thresholds** — the reduce/score magic numbers are lifted into named, env-overridable knobs: `REDUCER_PASSTHROUGH_CHARS` (default `100000` — documents shorter than this skip reduction and pass through whole, as the original did), `SCORING_MAX_CHARS` (default `300000` — the original scoring loop's policy-text cap, applied to the scoring call and the Workers AI consensus validators, whose 128k-token contexts it fits), and `PRIMARY_MAX_CHARS` (default `3200000` — the guard on the primary model's extraction/source-span inputs; DeepSeek v4-pro's 1M-token context means extraction sees the (near-)full document, exactly as the original did on Gemini's 1M window).
+- **Named thresholds** — the reduce/score magic numbers are lifted into named, env-overridable knobs: `REDUCER_PASSTHROUGH_CHARS` (default `100000` — documents shorter than this skip reduction and pass through whole, as the original did), `SCORING_MAX_CHARS` (default `300000` — the original scoring loop's policy-text cap, applied to the scoring call and the Workers AI consensus validators, whose 128k-token contexts it fits), and `PRIMARY_MAX_CHARS` (default `600000` — the guard on the primary model's extraction/source-span inputs: small/medium documents reach the model whole; it sits deliberately below DeepSeek v4-pro's 1M-token window because maximal-context prefill measured 10+ minutes per call, and beyond the cap the window packer hands the model the brand-relevant sections instead).
 - **Brand-aware window packing** — when a cap fires on an oversized document, the kept text is the document head plus windows around every brand-alias mention (merged in document order) rather than a blind head-cut: blind truncation amputated the per-drug criteria modules that big payer documents keep deep in the file. The applied mode is observable per brand in `meta.truncation` / `meta.scoring_truncation` (`null` | `"alias-windowed"` | `"head"`).
 
 ## Limitations
@@ -293,3 +307,7 @@ The system is **bounded to the Workers Paid included allotments** for realistic,
 ### Hard spend cap (~$5/mo)
 
 If you want a true ceiling rather than budget-by-design: Cloudflare dashboard → **AI** → **AI Gateway** → *your gateway* → **Settings** → set a **budget / spend limit** (~$5/month works for demo use) and, optionally, a **rate limit**. Because **both** the DeepSeek primary **and** the Workers AI validators now route through the gateway, this single limit caps **all** LLM spend for the app. Two complementary backstops: DeepSeek is **prepaid**, so its account balance is its own natural ceiling, and the Cloudflare dashboard offers **Workers AI usage alerts/notifications** if you want an early warning before the cap bites.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

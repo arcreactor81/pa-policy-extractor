@@ -25,7 +25,7 @@ Score against the PDF-derived truth verdicts produced by the eval harness.
 python container/benchmark/run_benchmark.py \
     --pdf-dir   <directory containing the policy PDFs> \
     --worklist  <PA_Business_Rules.xlsx | pairs.csv> \
-    --truth-dir <workdir>\_analysis\eval\verdicts \
+    --truth-dir <directory of truth verdict JSONs> \
     --out       benchmark_report.md \
     --runs      1
 ```
@@ -33,17 +33,17 @@ python container/benchmark/run_benchmark.py \
 - `--worklist` accepts the original `PA_Business_Rules.xlsx` (its `Submissions`
   tab's `Filename`/`Brand` columns) or a plain csv of `filename,brand` rows
   (header optional).
-- `--truth-dir` defaults to `<workdir>\_analysis\eval\verdicts`; each pair
-  is graded against `<pdf-stem>__<BRAND>.json`. Pairs with no verdict file are
-  skipped and listed in the report.
+- `--truth-dir` (required): a directory of truth verdicts, one
+  `<pdf-stem>__<BRAND>.json` per pair; pairs with no verdict file are skipped
+  and listed in the report.
 - `--runs` forwards the confidence-runs count to the pipeline (1..5).
 
 ## Grading semantics
 
-Matching reimplements the `norm()` / `struct_match()` helpers from
-`_analysis/eval/rescore_full.py`, so a cell counts as a match against the
-verdict's `derived` value exactly when the validated rescore would have counted
-it: exact match after normalization (lowercase, non-alphanumerics collapsed),
+Matching reimplements the `norm()` / `struct_match()` helpers from the
+project's offline eval harness (not included in this repo), so a cell counts
+as a match against the verdict's `derived` value exactly when the validated
+rescore would have counted it: exact match after normalization (lowercase, non-alphanumerics collapsed),
 leading-number equivalence, "absent" equivalence (NA/No/none/not specified/
 unspecified), yes/required equivalence, or containment either way. The Access
 Score is compared as a bucket (first integer in each value).

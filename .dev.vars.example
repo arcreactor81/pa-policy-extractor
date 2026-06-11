@@ -1,6 +1,6 @@
 # .dev.vars.example — copy to `.dev.vars` and fill in real values for local
 # `wrangler dev`. NOTE: `.dev.vars` is gitignored; never commit real secrets.
-# In production, secrets (DEEPSEEK_API_KEY, CF_AIG_TOKEN) go via
+# In production, secrets (DEEPSEEK_API_KEY, CF_AIG_TOKEN, CF_API_TOKEN) go via
 # `wrangler secret put`, NOT this file.
 
 # DeepSeek API key (Bearer token). Required. Keep this secret.
@@ -21,3 +21,8 @@ CF_AIG_GATEWAY_ID=""
 DEEPSEEK_MODEL="deepseek-v4-pro"
 DEEPSEEK_THINKING="on"
 DEEPSEEK_REASONING_EFFORT="high"
+
+# Cloudflare account API token scoped to Workers AI (Bearer). OPTIONAL — this is
+# what enables the multi-model "Cross-check" consensus (the UI ships with it ON).
+# Leave unset and consensus silently no-ops; the DeepSeek result is unaffected.
+# CF_API_TOKEN=""

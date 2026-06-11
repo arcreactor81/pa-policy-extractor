@@ -24,14 +24,15 @@ AI Gateway.
 - Built and validated almost entirely by **multi-agent workflows with adversarial review** (the human directed; agents
   implemented + cross-checked), and graded by an independent **Opus codebase evaluation**.
 
-Repo: `pa-policy-extractor/` (~74 files). Deploy: push to GitHub → GitHub Actions builds the container + `wrangler deploy`.
+Repo: `pa-policy-extractor/` (~65 files). Deploy: push to GitHub → GitHub Actions builds the container + `wrangler deploy`.
 
 ---
 
 ## 1. The Original Project (`CANDIDATE_ID`)
 
 A hackathon submission: **extract structured Prior-Authorization parameters for the Plaque Psoriasis (PsO) indication**
-from pharmaceutical PA policy PDFs, for a given drug brand.
+from pharmaceutical PA policy PDFs, for a given drug brand. (The author's own hackathon submission — this repo is a
+re-host of that same pipeline, not third-party work.)
 
 ### 1.1 What it produced
 For each `(PDF, brand)` pair, **13 parameters** plus `Filename` and `Brand`:
@@ -159,6 +160,9 @@ RateLimiter, JobCoordinator), **R2** (object storage), **D1** (SQLite — the li
 
 ## 6. Feature Set (everything the app does)
 
+> Comment markers like `W3`/`W5`/`Layer 3`/`#3 (cost)` in the source refer to the project's internal build-wave
+> numbering, kept for traceability.
+
 ### Core extraction (faithful to the original)
 - Upload a PA policy PDF, pick one or more of the 15 brands → the 13 parameters + Access Score + a one-sentence
   justification, streamed live (OCR → reduce → extract → score).
@@ -238,7 +242,8 @@ verbatim-loaded definitions at runtime with deliberate accuracy deltas — a cas
 full text), an extended coverage-field check that abstains-and-flags instead of clamping an uncovered-looking row's
 positive score to 0, and named env-overridable thresholds (`REDUCER_PASSTHROUGH_CHARS`, default 100000;
 `SCORING_MAX_CHARS`, default 300000 for scoring + the 128k-ctx consensus validators; `PRIMARY_MAX_CHARS`, default
-3200000 for the 1M-token-context primary's extraction/spans inputs). Oversized documents are brand-aware window
+600000 for the primary's extraction/spans inputs — kept under v4-pro's 1M-token window because maximal-context
+prefill measured 10+ min/call). Oversized documents are brand-aware window
 packed (head + alias windows), never blindly head-truncated. The notebook files stay byte-identical; the README's
 "Override layer" section lists each divergence.
 
@@ -323,7 +328,7 @@ pa-policy-extractor/
 ├── README.md                     deploy + usage + API + cost (operator-facing)
 ├── PROJECT_OVERVIEW.md           this document
 ├── wrangler.jsonc                Worker config: container, 3 DOs + migrations v1/v2/v3, R2, D1, vars, cron, assets
-├── package.json / tsconfig.json / vitest.config.ts / worker-configuration.d.ts
+├── package.json / tsconfig.json / vitest.config.mts / worker-configuration.d.ts
 ├── .github/workflows/            ci.yml (python+node gates + weekly real-stack run), deploy.yml (CI-gated build+deploy),
 │                                 gen-lockfile.yml, gen-pylock.yml (pins container/constraints.txt)
 ├── src/                          the Worker (TypeScript, ~3.1k lines)
@@ -348,6 +353,7 @@ pa-policy-extractor/
     ├── app.py                    Flask: /health /brands /extract /analyze (NDJSON), budget guard, body cap
     ├── pipeline/
     │   ├── notebook_loader.py    AST loader (verbatim defs from the notebooks)
+    │   ├── overrides.py          the documented accuracy override layer (patches the verbatim namespaces)
     │   ├── core.py               orchestration: OCR-once cache, brand fan-out, confidence, consensus
     │   ├── llm.py                DeepSeek client + Workers AI validators (OpenAI-compatible)
     │   └── explain.py            source-span pass (separate prompt, verbatim-guarded)
@@ -377,11 +383,11 @@ pa-policy-extractor/
 
 ## 13. Honest Caveats & Verification Status
 
-- **TypeScript was not locally type-checked** in this environment (no Node/`tsc`/`wrangler`/Docker — the dev machine is
-  slow). The Worker/DO TypeScript was reviewed on Opus, not compiled. **The first GitHub Actions CI run is the real
-  typecheck/test gate** — run `npm i && npm run typecheck && npm test` (or just push) and expect possibly a small fix
-  and committing the lockfile (the `gen-lockfile` workflow generates it). The **Python validators are tested** (the
-  pytest suite passes in CI with heavy deps stubbed).
+- **TypeScript was never type-checked locally** (no Node/`tsc`/`wrangler`/Docker — the dev machine is slow). The
+  Worker/DO TypeScript was reviewed on Opus; **GitHub Actions CI is the correctness gate** — it runs the typecheck and
+  the vitest suite on every push, and it passes. `package-lock.json` and `container/constraints.txt` are committed
+  (generated on runners by the `gen-lockfile` / `gen-pylock` workflows), so CI installs are reproducible and
+  integrity-pinned. The **Python validators are tested** (the pytest suite passes in CI with heavy deps stubbed).
 - **Runtime behavior** (Container OCR, DO WebSocket reconnect, R2/D1) should be confirmed with a **deploy smoke test**:
   one single PDF, a 2-PDF batch with a mid-job reload (reconnect), a cohort run, and the consensus toggle.
 - **LLM nondeterminism**: outputs vary slightly run-to-run (as the original documented). DeepSeek v4-pro ≠ Gemini, so

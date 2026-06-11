@@ -4,20 +4,21 @@ run_benchmark.py — end-to-end accuracy benchmark for the container pipeline.
 Runs the REAL pipeline (Docling + Surya OCR -> reducer w/ overrides -> DeepSeek
 extraction -> DeepSeek access scoring) over a worklist of (filename, brand)
 pairs and grades the 12 deliverable parameters + the Access Score against the
-PDF-derived truth verdicts produced by the eval harness
-(<workdir>\\_analysis\\eval\\verdicts\\<stem>__<BRAND>.json).
+PDF-derived truth verdicts (<pdf-stem>__<BRAND>.json) produced by the
+project's offline eval harness (not included in this repo).
 
 Usage (see benchmark/README.md):
     python container/benchmark/run_benchmark.py \
         --pdf-dir <dir with the policy PDFs> \
         --worklist <PA_Business_Rules.xlsx | pairs.csv> \
-        [--truth-dir <workdir>\\_analysis\\eval\\verdicts] \
+        --truth-dir <directory of truth verdict JSONs> \
         [--out benchmark_report.md] [--runs 1]
 
-Grading reimplements the norm()/struct_match() helpers from
-_analysis/eval/rescore_full.py so the match semantics are identical to the
-validated rescore: exact match after normalization, leading-number equivalence,
-NA/No/none "absent" equivalence, yes/required equivalence, and containment.
+Grading reimplements the norm()/struct_match() helpers from the project's
+offline eval harness (not included in this repo) so the match semantics are
+identical to the validated rescore: exact match after normalization,
+leading-number equivalence, NA/No/none "absent" equivalence, yes/required
+equivalence, and containment.
 
 IMPORTANT: importing this module performs NO LLM call and NO heavy import —
 pipeline.core (which pulls in docling/torch) is imported lazily inside main().
@@ -38,8 +39,6 @@ from pathlib import Path
 _CONTAINER_DIR = Path(__file__).resolve().parent.parent
 if str(_CONTAINER_DIR) not in sys.path:
     sys.path.insert(0, str(_CONTAINER_DIR))
-
-DEFAULT_TRUTH_DIR = r"<workdir>\_analysis\eval\verdicts"
 
 # The 12 deliverable parameters, in deliverable order (matches rescore_full.py).
 PARAMS = [
@@ -78,7 +77,8 @@ PARAM_ABBR = {
 }
 
 
-# ── Match semantics (reimplemented from _analysis/eval/rescore_full.py) ───────
+# ── Match semantics (reimplemented from the project's offline eval harness,
+#    not included in this repo) ───────────────────────────────────────────────
 def norm(s) -> str:
     """Lowercase, collapse every non-alphanumeric run to a single space."""
     s = str(s).strip().lower()
@@ -237,8 +237,8 @@ def main(argv=None) -> int:
     ap.add_argument("--worklist", required=True,
                     help="xlsx (Submissions tab, e.g. PA_Business_Rules.xlsx) or "
                          "csv of filename,brand pairs")
-    ap.add_argument("--truth-dir", default=DEFAULT_TRUTH_DIR,
-                    help=f"verdict JSON directory (default {DEFAULT_TRUTH_DIR})")
+    ap.add_argument("--truth-dir", required=True,
+                    help="directory of truth verdict JSONs (<pdf-stem>__<BRAND>.json)")
     ap.add_argument("--out", default="benchmark_report.md", help="output report path (markdown)")
     ap.add_argument("--runs", type=int, default=1,
                     help="confidence runs per (pdf, brand) pair (1..5, default 1)")

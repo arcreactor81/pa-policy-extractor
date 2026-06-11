@@ -1,22 +1,22 @@
-# Generate package-lock.json in the cloud — RUN THIS ONCE, MANUALLY.
+# Regenerate package-lock.json in the cloud — RUN MANUALLY AFTER A
+# package.json CHANGE.
 #
-# WHY: this repo ships no package-lock.json, so ci.yml/deploy.yml fall back to
-# `npm install` (resolves versions fresh on every run — a supply-chain weakness:
-# no integrity hashes, no pinned transitive tree). The author cannot run npm on
-# their (slow) local machine, so we generate the lockfile on a GitHub runner.
+# WHY: the lockfile IS committed (so ci.yml/deploy.yml run `npm ci` —
+# reproducible, integrity-pinned installs), but the author doesn't run npm on
+# their (slow) local machine, so whenever package.json changes the lockfile
+# must be regenerated on a GitHub runner — which is what this workflow does.
 #
-# HOW TO USE (the author runs this exactly once):
+# HOW TO USE (the author runs this after changing package.json):
 #   1. Go to the repo's "Actions" tab.
 #   2. Pick the "gen-lockfile" workflow in the left sidebar.
 #   3. Click "Run workflow" (uses the default branch, or pick another).
 #   4. The job runs `npm install --package-lock-only` and commits the resulting
 #      package-lock.json straight back to the branch it ran on.
 #
-# AFTER THAT: a package-lock.json exists in the repo, so ci.yml and deploy.yml
-# automatically switch from `npm install` to `npm ci` (reproducible,
-# integrity-pinned installs). No further manual steps — and you can delete this
-# workflow if you like, or re-run it whenever package.json changes and you want
-# to refresh the lockfile.
+# AFTER THAT: the refreshed package-lock.json is committed, and ci.yml /
+# deploy.yml keep using `npm ci` against it (they fall back to `npm install`
+# only if the lockfile were ever missing). No further manual steps — re-run
+# this whenever package.json changes.
 #
 # SAFETY: manual trigger only (workflow_dispatch — never runs on push/PR), and a
 # least-privilege token (permissions: contents: write, nothing else).
@@ -68,5 +68,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add package-lock.json
-          git commit -m "chore: add committed package-lock.json (enables 'npm ci' in CI/deploy)"
+          git commit -m "chore: regenerate package-lock.json (keeps 'npm ci' installs pinned)"
           git push

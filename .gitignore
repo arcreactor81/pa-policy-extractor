@@ -21,7 +21,13 @@ __pycache__/
 *.pyc
 .pytest_cache/
 
-# Local policy PDFs — NEVER commit policy documents
+# Local policy PDFs / result workbooks — NEVER commit policy documents or
+# extraction results, anywhere in the tree
 pdfs/
-/*.pdf
+*.pdf
+*.xlsx
+
+# Benchmark outputs (container/benchmark/run_benchmark.py writes these locally)
+benchmark_report.md
+
 .claude/
