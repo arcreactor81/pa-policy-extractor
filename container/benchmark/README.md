@@ -9,7 +9,9 @@ Score against the PDF-derived truth verdicts produced by the eval harness.
 ## Requirements
 
 - The **full container dependency stack** (docling / surya / torch / etc. —
-  `pip install -r container/requirements.txt -c container/constraints.txt`).
+  `pip install -r container/requirements.txt -c container/constraints.txt --extra-index-url https://download.pytorch.org/whl/cpu`).
+  The extra index keeps torch+torchvision on matched CPU builds (and is REQUIRED
+  once constraints.txt pins `+cpu` versions, which only that index serves).
   This is NOT a CI-stub test; it OCRs real PDFs.
 - The **DeepSeek env at runtime**: `DEEPSEEK_API_KEY` is required (plus the
   optional gateway vars — see `pipeline/llm.py` for the full contract). The

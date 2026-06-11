@@ -68,7 +68,10 @@ RUN install -d -o appuser -g appuser /app/.cache /app/.cache/huggingface /app/.c
 # failure they are allowed is a flaky model download (which lazy-loads later).
 USER appuser
 RUN python -c "import torch, torchvision; \
-from docling.document_converter import DocumentConverter; \
+from docling.datamodel.base_models import InputFormat; \
+from docling.datamodel.accelerator_options import AcceleratorDevice, AcceleratorOptions; \
+from docling.datamodel.pipeline_options import ThreadedPdfPipelineOptions, TableStructureOptions; \
+from docling.document_converter import DocumentConverter, PdfFormatOption; \
 from docling_surya import SuryaOcrOptions; \
 print('import gate OK: torch', torch.__version__, '| torchvision', torchvision.__version__)"
 

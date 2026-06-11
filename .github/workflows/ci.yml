@@ -134,7 +134,13 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           if [ -f container/constraints.txt ]; then
-            pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu -c container/constraints.txt
+            # NOTE: --extra-index-url (NOT exclusive --index-url) on the
+            # constrained branch: the gen-pylock freeze pins the WHOLE dep
+            # closure (numpy, pillow, ...) at PyPI versions the lagging CPU
+            # index may not carry — exclusive would be unsatisfiable. The
+            # torch/torchvision pins are ==X+cpu local versions only the CPU
+            # index serves, so CUDA wheels still cannot be selected.
+            pip install torch torchvision --extra-index-url https://download.pytorch.org/whl/cpu -c container/constraints.txt
             pip install -r container/requirements.txt -c container/constraints.txt --extra-index-url https://download.pytorch.org/whl/cpu
           else
             echo "no container/constraints.txt found — falling back to an unpinned resolve (run the gen-pylock workflow to create it)"
@@ -149,7 +155,10 @@ jobs:
         # on the test suite. Catches CPU/CUDA wheel mismatches immediately.
         run: |
           python -c "import torch, torchvision; \
-          from docling.document_converter import DocumentConverter; \
+          from docling.datamodel.base_models import InputFormat; \
+          from docling.datamodel.accelerator_options import AcceleratorDevice, AcceleratorOptions; \
+          from docling.datamodel.pipeline_options import ThreadedPdfPipelineOptions, TableStructureOptions; \
+          from docling.document_converter import DocumentConverter, PdfFormatOption; \
           from docling_surya import SuryaOcrOptions; \
           print('import gate OK: torch', torch.__version__, '| torchvision', torchvision.__version__)"
 
