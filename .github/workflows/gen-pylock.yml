@@ -49,15 +49,28 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Clean install of container/requirements.txt (CPU torch first)
-        # Mirrors container/Dockerfile: the CPU torch wheel first (Cloudflare
-        # Containers have no GPU, and the CUDA wheels would blow the runner's
-        # disk budget), then the requirements resolve on top of it. Deliberately
-        # NO -c constraints here — this is the fresh resolve being frozen.
+      - name: Clean install of container/requirements.txt (CPU torch+torchvision first)
+        # Mirrors container/Dockerfile: torch AND torchvision together as a
+        # MATCHED PAIR from the CPU wheel index (Cloudflare Containers have no
+        # GPU, the CUDA wheels would blow the runner's disk budget, and a
+        # PyPI/CUDA torchvision next to a +cpu torch fails at import — freezing
+        # that env would pin the breakage). The CPU index rides along as an
+        # EXTRA index on the requirements resolve so torch/torchvision stay on
+        # +cpu builds. Deliberately NO -c constraints here — this is the fresh
+        # resolve being frozen.
         run: |
           python -m pip install --upgrade pip
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install -r container/requirements.txt
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install -r container/requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
+
+      - name: Import gate (refuse to freeze a broken resolve)
+        # Same hard gate as the Dockerfile / weekly CI job: never commit a
+        # constraints.txt pinning a stack whose converter imports don't load.
+        run: |
+          python -c "import torch, torchvision; \
+          from docling.document_converter import DocumentConverter; \
+          from docling_surya import SuryaOcrOptions; \
+          print('import gate OK: torch', torch.__version__, '| torchvision', torchvision.__version__)"
 
       - name: Freeze the resolved versions to container/constraints.txt
         # A constraints file (-c) pins versions WITHOUT adding requirements, so

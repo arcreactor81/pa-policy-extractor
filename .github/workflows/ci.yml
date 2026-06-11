@@ -120,24 +120,38 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install the REAL python stack (CPU torch + docling + surya)
-        # Mirrors container/Dockerfile: the CPU torch wheel first (no GPU on the
-        # runner; the CUDA wheels would blow the disk budget), then the full
-        # requirements — version-locked by container/constraints.txt, which the
-        # gen-pylock workflow generates. Until that file is committed, fall back
-        # to an unpinned resolve (same pattern as the package-lock.json fallback
-        # in the node job above).
+      - name: Install the REAL python stack (CPU torch+torchvision + docling + surya)
+        # Mirrors container/Dockerfile: torch AND torchvision together as a
+        # MATCHED PAIR from the CPU wheel index first (no GPU on the runner; the
+        # CUDA wheels would blow the disk budget — and a PyPI/CUDA torchvision
+        # next to a +cpu torch fails at import with "operator torchvision::nms
+        # does not exist"), then the full requirements with the CPU index riding
+        # along as an EXTRA index so any re-resolution stays on +cpu builds.
+        # Version-locked by container/constraints.txt, which the gen-pylock
+        # workflow generates. Until that file is committed, fall back to an
+        # unpinned resolve (same pattern as the package-lock.json fallback in
+        # the node job above).
         run: |
           python -m pip install --upgrade pip
           if [ -f container/constraints.txt ]; then
-            pip install torch --index-url https://download.pytorch.org/whl/cpu -c container/constraints.txt
-            pip install -r container/requirements.txt -c container/constraints.txt
+            pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu -c container/constraints.txt
+            pip install -r container/requirements.txt -c container/constraints.txt --extra-index-url https://download.pytorch.org/whl/cpu
           else
             echo "no container/constraints.txt found — falling back to an unpinned resolve (run the gen-pylock workflow to create it)"
-            pip install torch --index-url https://download.pytorch.org/whl/cpu
-            pip install -r container/requirements.txt
+            pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+            pip install -r container/requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
           fi
           pip install pytest
+
+      - name: Import gate (torch/torchvision ABI + docling converter imports)
+        # Same hard gate as the Dockerfile: prove the exact imports
+        # core._build_converter performs actually load before spending 30+ min
+        # on the test suite. Catches CPU/CUDA wheel mismatches immediately.
+        run: |
+          python -c "import torch, torchvision; \
+          from docling.document_converter import DocumentConverter; \
+          from docling_surya import SuryaOcrOptions; \
+          print('import gate OK: torch', torch.__version__, '| torchvision', torchvision.__version__)"
 
       - name: Run container tests against the real stack (no stubs)
         # Same suite as the fast job, but with the real deps importable the

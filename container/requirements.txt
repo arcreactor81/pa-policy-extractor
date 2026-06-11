@@ -24,11 +24,18 @@ docling-core
 docling-surya
 surya-ocr
 
-# Deep-learning backend. The Dockerfile installs the CPU build of torch FIRST
-# (Cloudflare Containers have no GPU); this line just records the dependency so
-# the resolver keeps the already-installed CPU wheel. Unpinned on purpose —
-# pinning a version absent from the CPU wheel index would break the build.
+# Deep-learning backend. The Dockerfile installs the CPU builds of torch AND
+# torchvision FIRST, as a matched pair from the PyTorch CPU wheel index
+# (Cloudflare Containers have no GPU); these lines just record the dependency so
+# the resolver keeps the already-installed CPU wheels. torchvision MUST be named
+# here even though nothing imports it directly: the docling stack drags it in
+# transitively, and an unrecorded torchvision resolves from PyPI as a CUDA build
+# whose compiled ops cannot register against a +cpu torch — the import then dies
+# with "operator torchvision::nms does not exist" and every OCR fails. Unpinned
+# on purpose — pinning a version absent from the CPU wheel index would break the
+# build.
 torch
+torchvision
 
 # Steps 3 & 4 call DeepSeek v4-pro over HTTPS (OpenAI-compatible).
 requests

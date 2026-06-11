@@ -32,14 +32,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libgl1 libglib2.0-0 libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-# CPU build of torch first — Cloudflare Containers have no GPU. Installing it from
-# the CPU wheel index keeps the image small and avoids pulling CUDA.
-RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+# CPU builds of torch AND torchvision first, as a MATCHED PAIR from the CPU wheel
+# index — Cloudflare Containers have no GPU, and the pair must come from the SAME
+# index: torchvision's compiled ops are built against one exact torch, and a PyPI
+# (CUDA) torchvision next to a +cpu torch imports torch fine but never registers
+# its operators ("operator torchvision::nms does not exist" → docling's converter
+# import dies → every OCR fails). Installing torch alone here was exactly that
+# bug: the requirements step then dragged torchvision in transitively from PyPI.
+RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
 # constraints.txt narrows the floating deps with verified pins (see notes there);
-# requirements stay loose so the transformers pin still resolves.
+# requirements stay loose so the transformers pin still resolves. The CPU wheel
+# index rides along as an EXTRA index so that if the resolver must move torch /
+# torchvision to satisfy the docling stack, it can still pick +cpu builds (PEP 440
+# local versions like 2.x.y+cpu outrank the same PyPI release, so the installed
+# CPU pair wins whenever versions tie).
 COPY requirements.txt constraints.txt ./
-RUN pip install --no-cache-dir -r requirements.txt -c constraints.txt
+RUN pip install --no-cache-dir -r requirements.txt -c constraints.txt \
+      --extra-index-url https://download.pytorch.org/whl/cpu
 
 # App code copied owned by the runtime user directly (no recursive chown needed).
 COPY --chown=appuser:appuser . .
@@ -50,15 +60,27 @@ COPY --chown=appuser:appuser . .
 RUN install -d -o appuser -g appuser /app/.cache /app/.cache/huggingface /app/.cache/torch \
     && chown appuser:appuser /app
 
+# HARD import gate — deliberately NO `|| true`. Prove the heavy stack actually
+# loads (the exact imports core._build_converter performs) before the best-effort
+# model bake below. A torch/torchvision ABI mismatch or a broken docling resolve
+# now FAILS THE BUILD on the Actions runner instead of shipping an image whose
+# every OCR dies at runtime; the bake steps stay `|| true` because the only
+# failure they are allowed is a flaky model download (which lazy-loads later).
+USER appuser
+RUN python -c "import torch, torchvision; \
+from docling.document_converter import DocumentConverter; \
+from docling_surya import SuryaOcrOptions; \
+print('import gate OK: torch', torch.__version__, '| torchvision', torchvision.__version__)"
+
 # Best-effort model bake: download the OCR / layout / table models into the HF
 # cache (under /app/.cache, see ENV above) so cold starts skip the multi-minute
 # download. Non-fatal — `|| true` means a failed bake just defers the download to
 # the container's first real request. docling-tools fetches the catalog; the
 # warmup then runs a FULL convert over a synthetic text+table page so the Surya
 # recognition and table-structure models (which only load when there is text /
-# a table to process) are exercised and cached too. Run AS appuser so every
-# cached file is readable/writable (incl. Surya/HF lock files) at runtime.
-USER appuser
+# a table to process) are exercised and cached too. Runs AS appuser (set above,
+# before the import gate) so every cached file is readable/writable (incl.
+# Surya/HF lock files) at runtime.
 RUN docling-tools models download || true
 RUN python warmup_build.py || true
 
