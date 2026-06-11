@@ -62,7 +62,11 @@ import time
 import requests
 
 MODEL_ID = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro").strip()
-_TIMEOUT = float(os.environ.get("DEEPSEEK_TIMEOUT", "300"))
+# 900s: window-packed inputs on big documents run multi-minute prefill on the
+# provider side (measured live); 300s timed out the slow tail and surfaced as
+# per-brand "extraction failed". The container's NDJSON heartbeats keep the
+# client stream alive while a call runs long.
+_TIMEOUT = float(os.environ.get("DEEPSEEK_TIMEOUT", "900"))
 
 # ── W3 secondary (Workers AI) validator config ───────────────────────────────
 # 3-MODEL consensus: a LIST of Workers AI validators (VALIDATOR_MODELS, CSV of

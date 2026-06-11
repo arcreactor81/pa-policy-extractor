@@ -179,11 +179,14 @@ def _truncate_policy_text(policy_text: str, filename: str = "", brand: str = "",
     # Assemble in document order under the budget. Document order (not
     # relevance-ranked) keeps the head first and preserves the policy's own
     # narrative flow for the LLM; the gap marker tells the model text was cut.
+    # The pack budget is the LEANER of the caller's cap and WINDOW_PACK_BUDGET
+    # (unique packs are prefix-cache misses — size is pure prefill latency).
+    budget = min(cap, WINDOW_PACK_BUDGET)
     gap = "\n\n[... unrelated policy sections omitted ...]\n\n"
     pieces, total = [], 0
     for start, end in merged:
         gap_cost = len(gap) if pieces else 0
-        room = cap - total - gap_cost
+        room = budget - total - gap_cost
         if room <= 0:
             break
         chunk = policy_text[start:end][:room]
@@ -231,6 +234,14 @@ PRIMARY_MAX_CHARS = int(os.environ.get("PRIMARY_MAX_CHARS", "600000"))
 WINDOW_HEAD_CHARS = int(os.environ.get("WINDOW_HEAD_CHARS", "40000"))
 WINDOW_BEFORE_CHARS = int(os.environ.get("WINDOW_BEFORE_CHARS", "5000"))
 WINDOW_AFTER_CHARS = int(os.environ.get("WINDOW_AFTER_CHARS", "20000"))
+# Assembly budget for the WINDOWED pack specifically (min'd with the caller's
+# cap). Unique per-brand packs are DeepSeek prefix-cache MISSES, so their size
+# is pure prefill latency: ~360k chars (~90k tokens) keeps cache-miss calls in
+# the ~1-2 min class (measured: near-600k unique packs ran 5-8 min and tripped
+# timeouts). The HEAD fallback deliberately ignores this budget: identical
+# head slices are shared across brands, so the prefix cache makes their size
+# nearly free.
+WINDOW_PACK_BUDGET = int(os.environ.get("WINDOW_PACK_BUDGET", "360000"))
 # Whether the source-span explainability pass runs by default.
 DEFAULT_SOURCE_SPANS = str(os.environ.get("SOURCE_SPANS", "true")).strip().lower() not in (
     "0", "false", "no", "off", "",

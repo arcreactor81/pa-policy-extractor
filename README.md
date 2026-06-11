@@ -224,6 +224,7 @@ CONFIDENCE_RUNS                            # default extraction repeats when `ru
 REDUCER_PASSTHROUGH_CHARS                  # reducer full-document passthrough threshold (default "100000")
 SCORING_MAX_CHARS                          # policy-text cap for scoring + consensus validators (default "300000")
 PRIMARY_MAX_CHARS                          # policy-text guard for primary extraction/spans (default "600000"; huge docs window-pack beyond it)
+WINDOW_PACK_BUDGET                         # assembly budget for unique window-packs (default "360000" — cache-miss prefill latency control)
 ```
 
 `LIBRARY_RETENTION_DAYS` and `RETENTION_DAYS` are read by the **Worker** (D1/R2 pruning + batch cleanup), not the container, so they are not in this forwarded set.
