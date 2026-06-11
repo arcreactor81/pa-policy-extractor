@@ -84,10 +84,11 @@ export interface Env {
 
   /**
    * Pipeline tunable: max policy-text chars for the PRIMARY model's
-   * extraction + source-span inputs. DeepSeek v4-pro has a 1M-token context,
-   * so this guard is far above the scoring cap — the primary path sees the
-   * (near-)full document; over-cap text is brand-aware window packed. Default
-   * "3200000".
+   * extraction + source-span inputs. Above the scoring cap (small/medium
+   * documents reach the model whole) but deliberately below DeepSeek's
+   * 1M-token window — maximal-context prefill measured 10+ min/call; over-cap
+   * text is brand-aware window packed to the brand-relevant sections. Default
+   * "600000".
    */
   PRIMARY_MAX_CHARS?: string;
 

@@ -213,10 +213,11 @@ export class PaContainer extends Container<Env> {
     CONFIDENCE_RUNS: this.env.CONFIDENCE_RUNS ?? "1",
     REDUCER_PASSTHROUGH_CHARS: this.env.REDUCER_PASSTHROUGH_CHARS ?? "100000",
     SCORING_MAX_CHARS: this.env.SCORING_MAX_CHARS ?? "300000",
-    // Primary (DeepSeek v4-pro, 1M-token ctx) input guard — far above the
-    // scoring cap; extraction/spans see the (near-)full document like the
-    // validated original did on Gemini's 1M window.
-    PRIMARY_MAX_CHARS: this.env.PRIMARY_MAX_CHARS ?? "3200000",
+    // Primary input guard — above the scoring cap so small/medium documents
+    // reach the model whole; huge documents get brand-aware window packing.
+    // Kept well under DeepSeek's 1M-token window: maximal-context prefill
+    // measured at 10+ min/call, untenable for interactive use.
+    PRIMARY_MAX_CHARS: this.env.PRIMARY_MAX_CHARS ?? "600000",
   };
 }
 

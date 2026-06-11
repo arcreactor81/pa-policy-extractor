@@ -139,15 +139,17 @@
     // toggle sends runs=3 explicitly; batch jobs also send runs explicitly).
     // REDUCER_PASSTHROUGH_CHARS / SCORING_MAX_CHARS: override-layer thresholds
     // (reducer passthrough gate; scoring+validator input cap matching the
-    // validated original's scoring loop). PRIMARY_MAX_CHARS: the much larger
-    // guard for the primary model's extraction/spans inputs — DeepSeek v4-pro
-    // has a 1M-token context, so the primary path sees the (near-)full document
-    // exactly like the original did on Gemini's 1M window; over-cap documents
-    // are brand-aware window packed, never blind head-truncated.
+    // validated original's scoring loop). PRIMARY_MAX_CHARS: the larger guard
+    // for the primary model's extraction/spans inputs — small/medium documents
+    // go to the model whole; beyond the cap, huge payer documents are
+    // brand-aware window packed (head + criteria modules), never blind
+    // head-truncated. Deliberately below DeepSeek v4-pro's 1M-token window:
+    // measured live, ~180k-token calls ran 10+ minutes each (prefill), so
+    // maximal-context inputs are operationally untenable for interactive use.
     "CONFIDENCE_RUNS": "1",
     "REDUCER_PASSTHROUGH_CHARS": "100000",
     "SCORING_MAX_CHARS": "300000",
-    "PRIMARY_MAX_CHARS": "3200000",
+    "PRIMARY_MAX_CHARS": "600000",
 
     // Layer 3 (async/batch jobs) — subscription-bounded caps:
     //   MAX_PDFS_PER_JOB    — hard cap on PDFs per job.

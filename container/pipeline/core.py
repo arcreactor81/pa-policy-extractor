@@ -211,16 +211,18 @@ DEFAULT_CONFIDENCE_RUNS = int(os.environ.get("CONFIDENCE_RUNS", "1"))
 # every model call; we restore that cap and apply it before BOTH the extraction
 # call and the access-scoring call (env-overridable, default unchanged).
 SCORING_MAX_CHARS = int(os.environ.get("SCORING_MAX_CHARS", "300000"))
-# Cap for the PRIMARY model's inputs (extraction + the source-span pass).
-# DeepSeek v4-pro has a 1,048,576-token context (verified June 2026), so the
-# primary path does NOT need the notebook's 300k-char scoring cap that briefly
-# (and wrongly) bounded it: 3.2M chars ≈ ~800k tokens leaves headroom for
-# prompts + output inside the 1M window. This restores the ORIGINAL pipeline's
-# shape — extraction saw the full document (Gemini 1M ctx), only the scoring
-# loop truncated to 300k. Cost note: v4-pro cache-miss input ≈ $0.435/M tokens
-# and repeated same-document calls hit DeepSeek's prefix cache (≈$0.0036/M),
-# so a 705k-char document costs ~$0.08 on the first call and cents after.
-PRIMARY_MAX_CHARS = int(os.environ.get("PRIMARY_MAX_CHARS", "3200000"))
+# Cap for the PRIMARY model's inputs (extraction + the source-span pass) —
+# larger than the scoring cap, deliberately NOT the full 1M-token window.
+# DeepSeek v4-pro accepts 1,048,576 tokens, but prefill latency makes maximal
+# inputs operationally untenable: measured live, ~180k-token extraction calls
+# ran 10+ minutes EACH (a 15-brand basket would take hours). 600k chars
+# (~150k tokens) keeps small/medium documents whole, and beyond it the
+# brand-aware window packer (see _truncate_policy_text) distills huge payer
+# documents to their brand-relevant sections — head + criteria modules,
+# typically ~200-350k chars — which is both faster AND more on-target than
+# blind full-document prefill. Cost note: v4-pro cache-miss input ≈ $0.435/M
+# tokens; same-document repeats hit DeepSeek's prefix cache (≈$0.0036/M).
+PRIMARY_MAX_CHARS = int(os.environ.get("PRIMARY_MAX_CHARS", "600000"))
 # Brand-aware window packing knobs for over-cap documents (see
 # _truncate_policy_text). HEAD keeps the document preamble (title / indication
 # tables / global criteria that apply to every drug); BEFORE/AFTER bracket each
