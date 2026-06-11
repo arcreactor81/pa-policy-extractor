@@ -32,9 +32,9 @@
           <rect x="3" y="3" width="42" height="42" rx="11" fill="url(#lg)" />
           <defs>
             <linearGradient id="lg" x1="0" y1="0" x2="1" y2="1">
-              <stop offset="0" stop-color="#6366f1" />
-              <stop offset=".55" stop-color="#a855f7" />
-              <stop offset="1" stop-color="#ec4899" />
+              <stop offset="0" stop-color="#8b5cf6" />
+              <stop offset=".55" stop-color="#d946ef" />
+              <stop offset="1" stop-color="#fb923c" />
             </linearGradient>
           </defs>
           <rect x="13" y="26" width="5" height="11" rx="1.5" fill="#fff" opacity=".95" />
@@ -317,8 +317,16 @@
 
     <!-- STREAM / PROGRESS -->
     <section id="progress" class="panel progress-panel mode-hide-batch mode-hide-library" aria-live="polite" hidden>
+      <!-- Overall run progress: indeterminate sweep during OCR, then fills as
+           brands complete (app.js drives #progress-fill width). -->
+      <div id="progress-track" class="progress-track indeterminate" aria-hidden="true">
+        <div id="progress-fill" class="progress-fill"></div>
+      </div>
+
       <div class="progress-head">
-        <div class="spinner" id="progress-spinner" aria-hidden="true"></div>
+        <div class="spinner" id="progress-spinner" aria-hidden="true">
+          <span class="spinner-core"></span>
+        </div>
         <div class="progress-headtext">
           <p class="progress-title">Analyzing <strong id="progress-target"></strong>&hellip;</p>
           <p class="progress-meta">
@@ -329,18 +337,31 @@
         </div>
       </div>
 
-      <!-- OCR stage -->
+      <!-- OCR stage: mini document with shimmer lines + scan beam (decorative;
+           the status dot and detail text carry the state for AT users) -->
       <div id="ocr-stage" class="stage-row" hidden>
-        <span class="stage-icon" id="ocr-icon" aria-hidden="true"></span>
+        <div class="scan-doc" aria-hidden="true">
+          <span class="scan-doc__line"></span>
+          <span class="scan-doc__line"></span>
+          <span class="scan-doc__line"></span>
+          <span class="scan-doc__line"></span>
+          <span class="scan-doc__beam"></span>
+        </div>
         <div class="stage-body">
           <span class="stage-name">OCR &mdash; reading the PDF</span>
           <span id="ocr-detail" class="stage-detail subtle"></span>
         </div>
+        <span class="stage-icon" id="ocr-icon" aria-hidden="true"></span>
       </div>
 
       <!-- Per-brand progress list -->
       <ul id="brand-progress" class="brand-progress" hidden></ul>
     </section>
+
+    <!-- RUN SUMMARY: post-analysis digest (stat tiles + clickable leaderboard).
+         Content is built entirely by renderRunSummary() in app.js once a run
+         finishes; hidden again when a new run starts. -->
+    <section id="run-summary" class="panel summary-panel mode-hide-batch mode-hide-library" aria-label="Run summary" hidden></section>
 
     <!-- GLOBAL ERROR -->
     <section id="error-box" class="panel error-panel mode-hide-batch mode-hide-library" role="alert" hidden>

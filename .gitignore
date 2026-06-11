@@ -24,3 +24,4 @@ __pycache__/
 # Local policy PDFs — NEVER commit policy documents
 pdfs/
 /*.pdf
+.claude/

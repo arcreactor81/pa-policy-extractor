@@ -103,6 +103,8 @@
   var ocrIcon = $("ocr-icon");
   var ocrDetail = $("ocr-detail");
   var brandProgress = $("brand-progress");
+  var progressTrack = $("progress-track");
+  var progressFill = $("progress-fill");
 
   var errorBox = $("error-box");
   var errorMessage = $("error-message");
@@ -176,6 +178,8 @@
       results: [],       // ordered list of { brand, data } as they arrive
       ocrDone: false,
       ocrCached: false,  // set from the 'start' event; guards ocr_start cache-flash
+      doneBrands: 0,     // terminal (result|error) brands — drives the progress bar
+      failedBrands: [],  // [{brand, error}] — drives the run summary's failure strip
       cardSeq: 0,        // for staggered card-enter timing
       deep: false,       // "Deep confidence" toggle (runs=3) — set in analyze()
       quotes: true,      // "Source quotes" toggle (explain) — set in analyze()
@@ -576,6 +580,18 @@
     progressSpinner.classList.remove("done");
     show(progressEl);
 
+    // Overall track: indeterminate sweep until the brand fan-out begins.
+    // Clear the inline width — it would override the .indeterminate class
+    // width (inline > class) and collapse the sweeping comet to 0px.
+    run.doneBrands = 0;
+    run.failedBrands = [];
+    if (progressTrack) progressTrack.classList.add("indeterminate");
+    if (progressFill) progressFill.style.width = "";
+
+    // A fresh run invalidates the previous run's digest (built in finalizeRun).
+    var summaryEl = document.getElementById("run-summary");
+    if (summaryEl) hide(summaryEl);
+
     // OCR stage: pending until ocr_start.
     show(ocrStage);
     setStageIcon(ocrIcon, "pending");
@@ -588,6 +604,18 @@
 
     elapsedEl.textContent = "0.0s";
     startElapsedClock();
+  }
+
+  // Overall progress: 0% -> 8% when OCR lands, then 8..98% as brands finish
+  // (the last 2% closes in stopProgress so the bar visibly "completes").
+  function setProgressFill(pct) {
+    if (!progressFill) return;
+    progressFill.style.width = Math.max(0, Math.min(100, pct)) + "%";
+  }
+  function bumpBrandProgress() {
+    if (!run || !run.brands || !run.brands.length) return;
+    run.doneBrands = (run.doneBrands || 0) + 1;
+    setProgressFill(8 + 90 * (run.doneBrands / run.brands.length));
   }
 
   // Drive the elapsed clock via requestAnimationFrame, repainting at most ~10fps
@@ -619,6 +647,8 @@
     stopElapsedClock();
     progressSpinner.classList.add("done");
     setOcrScanning(false);
+    if (progressTrack) progressTrack.classList.remove("indeterminate");
+    setProgressFill(100);
   }
 
   function hideProgress() { hide(progressEl); }
@@ -662,6 +692,10 @@
       run.rows[b] = { li: li, steps: stepRefs, status: status, order: stepDefs.map(function (s) { return s[0]; }) };
     });
     show(brandProgress);
+
+    // OCR is done once rows exist: switch the track to determinate fill.
+    if (progressTrack) progressTrack.classList.remove("indeterminate");
+    setProgressFill(8);
   }
 
   // Ensure progress rows exist even if ocr_done was skipped/out of order.
@@ -733,7 +767,11 @@
   function finishBrandRow(brand, ok, errMsg) {
     ensureBrandRows();
     var row = run.rows[brand];
-    if (!row) return;
+    // The finished guard makes terminal events idempotent: a duplicated result
+    // line (or error-then-result for the same brand) must not double-bump the
+    // overall progress bar.
+    if (!row || row.finished) return;
+    row.finished = true;
     row.li.classList.remove("active");
     if (ok) {
       row.li.classList.add("ok");
@@ -750,6 +788,7 @@
       row.status.title = errMsg || "";
       row.status.className = "bp-status bp-err";
     }
+    bumpBrandProgress();
   }
 
   // =========================================================================
@@ -976,7 +1015,13 @@
 
       case "error":
         if (evt.brand) {
-          // per-brand failure: mark the row, continue
+          // per-brand failure: mark the row, continue. Tracked for the run
+          // summary's failed-brands strip — but only the FIRST terminal event
+          // per brand counts (mirrors finishBrandRow's finished guard).
+          var failedRow = run.rows && run.rows[evt.brand];
+          if (!failedRow || !failedRow.finished) {
+            (run.failedBrands = run.failedBrands || []).push({ brand: evt.brand, error: evt.error || "" });
+          }
           finishBrandRow(evt.brand, false, evt.error);
           renderBrandError(evt.brand, evt.error);
         } else {
@@ -1008,12 +1053,168 @@
     }
   }
 
+  // =========================================================================
+  // render: RUN SUMMARY — post-analysis digest (stat tiles + leaderboard)
+  // =========================================================================
+  // Map a 0–100 access score onto the bucket color tokens shared with the
+  // gauge (--stop-*). >=90 borrows the emerald 100-stop so a near-perfect
+  // score reads "open access" rather than merely "preferred".
+  function summaryStopColor(score) {
+    if (score >= 90) return "var(--stop-100)";
+    if (score >= 75) return "var(--stop-75)";
+    if (score >= 50) return "var(--stop-50)";
+    if (score >= 25) return "var(--stop-25)";
+    return "var(--stop-0)";
+  }
+
+  // Leaderboard row click: scroll the brand's result card into view and pulse
+  // a temporary highlight so the eye lands on the right card in a long stack.
+  function jumpToBrandCard(brand) {
+    var card = document.querySelector('[data-brand-card="' + brand + '"]');
+    if (!card) return;
+    card.scrollIntoView({ behavior: reducedMotion() ? "auto" : "smooth", block: "start" });
+    // Restart the flash cleanly on a repeat click: remove -> force reflow ->
+    // re-add re-triggers the CSS animation from its first frame.
+    card.classList.remove("card-flash");
+    void card.offsetWidth;
+    card.classList.add("card-flash");
+    setTimeout(function () { card.classList.remove("card-flash"); }, 1600);
+  }
+
+  // One stat tile for the summary grid. `grad` adds the gradient-text class
+  // (same background-clip treatment as the big gauge score number).
+  function sumTile(label, value, sub, grad) {
+    var t = el("div", "sum-tile");
+    t.appendChild(el("div", "sum-tile-label", label));
+    t.appendChild(el("div", "sum-tile-value" + (grad ? " " + grad : ""), value));
+    if (sub) t.appendChild(el("div", "sum-tile-sub subtle", sub));
+    return t;
+  }
+
+  // Build the #run-summary panel for the finished run: header ("n of m brands
+  // analyzed · total time"), stat tiles (analyzed / average / best / lowest),
+  // and a ranked, clickable leaderboard with animated score bars. Failed
+  // brands (run.failedBrands, additive — may be absent) get compact red rows
+  // at the bottom. Idempotent: clears and rebuilds on every call. The section
+  // is looked up lazily here, NOT in the element-refs block at the top.
+  function renderRunSummary() {
+    var panel = document.getElementById("run-summary");
+    if (!panel || !run) return;
+    clearChildren(panel);
+
+    var results = run.results || [];
+    var failed = run.failedBrands || [];
+    var total = (run.brands && run.brands.length) || (results.length + failed.length);
+
+    // One row per scored brand. "NA"/non-numeric scores keep their row but
+    // sort last and render "—" with an empty bar.
+    var rows = results.map(function (r) {
+      var res = (r.data && r.data.result) || {};
+      var raw = res["Access Score"];
+      var hasScore = raw != null && String(raw).trim() !== "" && !isNaN(Number(raw));
+      return { brand: r.brand, score: hasScore ? Number(raw) : null, hasScore: hasScore };
+    });
+    rows.sort(function (a, b) {
+      if (a.hasScore && b.hasScore) return b.score - a.score;
+      return a.hasScore ? -1 : (b.hasScore ? 1 : 0);
+    });
+    var scored = rows.filter(function (r) { return r.hasScore; });
+
+    // -- header --------------------------------------------------------------
+    panel.appendChild(el("h2", "panel-title", "Run summary"));
+    var subText = results.length + " of " + total + " brand" + (total === 1 ? "" : "s") + " analyzed";
+    if (run.totalMs != null) subText += " · " + fmtMs(run.totalMs);
+    panel.appendChild(el("p", "panel-sub subtle summary-sub", subText));
+
+    // -- stat tiles ------------------------------------------------------------
+    var avg = null;
+    if (scored.length) {
+      var sum = 0;
+      scored.forEach(function (r) { sum += r.score; });
+      avg = Math.round((sum / scored.length) * 10) / 10;
+    }
+    var best = scored.length ? scored[0] : null;
+    var worst = scored.length ? scored[scored.length - 1] : null;
+
+    var tiles = el("div", "sum-tiles");
+    tiles.appendChild(sumTile("Brands analyzed", results.length + "/" + total,
+      failed.length ? (failed.length + " failed") : "", null));
+    tiles.appendChild(sumTile("Average access score", avg == null ? "—" : String(avg), "", "sum-grad"));
+    tiles.appendChild(sumTile("Best access", best ? String(best.score) : "—", best ? best.brand : "", null));
+    tiles.appendChild(sumTile("Lowest access", worst ? String(worst.score) : "—", worst ? worst.brand : "", null));
+    panel.appendChild(tiles);
+
+    // -- leaderboard -----------------------------------------------------------
+    panel.appendChild(el("h3", "sum-lb-title", "Access leaderboard"));
+    var list = el("ul", "lb-list");
+    var fills = [];   // [fillEl, pct] pairs — widths applied post-insert (below)
+
+    rows.forEach(function (r, i) {
+      var li = el("li", "lb-item");
+      var row = el("button", "lb-row");
+      row.type = "button";
+      row.style.setProperty("--d", (i * 40) + "ms");    // staggered row entrance
+      if (r.hasScore) row.style.setProperty("--stop-color", summaryStopColor(r.score));
+      row.setAttribute("aria-label",
+        "Jump to " + r.brand + " result, access score " + (r.hasScore ? r.score : "NA"));
+
+      row.appendChild(el("span", "lb-rank", String(i + 1)));
+      row.appendChild(el("span", "lb-brand", r.brand));
+      var bar = el("span", "lb-bar");
+      var fill = el("span", "lb-bar-fill");
+      bar.appendChild(fill);
+      row.appendChild(bar);
+      row.appendChild(el("span", "lb-score", r.hasScore ? String(r.score) : "—"));
+
+      if (r.hasScore) fills.push([fill, Math.max(0, Math.min(100, r.score))]);
+      row.addEventListener("click", function () { jumpToBrandCard(r.brand); });
+
+      li.appendChild(row);
+      list.appendChild(li);
+    });
+
+    // Failed brands: compact red rows at the bottom (full error on hover).
+    failed.forEach(function (f, j) {
+      var li = el("li", "lb-item");
+      var rowF = el("div", "lb-fail");
+      rowF.style.setProperty("--d", ((rows.length + j) * 40) + "ms");
+      rowF.appendChild(el("span", "lb-fail-glyph", "!"));
+      rowF.appendChild(el("span", "lb-brand", f.brand));
+      var msg = String(f.error || "Unknown error");
+      var msgEl = el("span", "lb-fail-msg", msg.length > 90 ? msg.slice(0, 87) + "…" : msg);
+      msgEl.title = msg;
+      rowF.appendChild(msgEl);
+      li.appendChild(rowF);
+      list.appendChild(li);
+    });
+
+    panel.appendChild(list);
+    show(panel);
+
+    // Animate the score bars 0 -> width. The width must be set AFTER the rows
+    // are in the document AND after a committed frame (double rAF), otherwise
+    // the browser coalesces the 0-width start state with the final width and
+    // the CSS width transition never fires. Setting el.style.width is fine
+    // under our CSP — only inline <style>/handlers are banned, not style IDL.
+    function applyWidths() {
+      fills.forEach(function (p) { p[0].style.width = p[1] + "%"; });
+    }
+    if (reducedMotion()) {
+      applyWidths();   // bars snap straight to their final width
+    } else {
+      requestAnimationFrame(function () { requestAnimationFrame(applyWidths); });
+    }
+  }
+
   function finalizeRun() {
     if (!run) { hideProgress(); return; }
     // Keep the progress panel visible briefly only if nothing rendered;
     // otherwise hide it now that cards are present.
     var anyResult = run.results.length > 0;
     if (anyResult) { show(resultsEl); ensureSingleExportBar(); }
+    // Post-run digest: stat tiles + leaderboard over this run's brands —
+    // rendered whenever there is anything (results or failures) to summarize.
+    if (anyResult || (run.failedBrands && run.failedBrands.length)) renderRunSummary();
     hideProgress();
     renderHistory();
   }
@@ -1047,6 +1248,9 @@
   // =========================================================================
   function renderBrandResult(evt) {
     var card = getOrCreateCard(evt.brand);
+    // Jump anchor for the run-summary leaderboard (single flow only — batch
+    // clones cards into its own sections and never sets this).
+    card.setAttribute("data-brand-card", evt.brand);
     populateBrandCard(card, evt, selectedFile ? selectedFile.name : "");
   }
 

@@ -550,9 +550,12 @@
       detailCopyBtn.onclick = function () { copyPermalink(id, detailStatus); };
     }
 
-    // Loading placeholder card.
+    // Loading placeholder card. The spinner ring lives on a .spinner-core
+    // child (the .spinner element itself is just the positioning box + glow).
     var loadingCard = PA.el("div", "lib-detail-loading panel");
-    loadingCard.appendChild(PA.el("span", "spinner", ""));
+    var loadingSpinner = PA.el("span", "spinner", "");
+    loadingSpinner.appendChild(PA.el("span", "spinner-core", ""));
+    loadingCard.appendChild(loadingSpinner);
     loadingCard.appendChild(PA.el("p", "subtle", "Loading saved result…"));
     detailHost.appendChild(loadingCard);
 
