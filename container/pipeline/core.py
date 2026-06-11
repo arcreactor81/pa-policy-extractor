@@ -125,11 +125,15 @@ def _brand_alias_patterns(brand: str):
     return pats
 
 
-def _truncate_policy_text(policy_text: str, filename: str = "", brand: str = "") -> str:
-    """Cap the policy text at SCORING_MAX_CHARS before any LLM call.
+def _truncate_policy_text(policy_text: str, filename: str = "", brand: str = "",
+                          cap: int | None = None) -> str:
+    """Cap the policy text at `cap` chars (default SCORING_MAX_CHARS) before an
+    LLM call.
 
-    The cap itself mirrors the original access_score.ipynb scoring loop
-    (MAX_CHARS = 300_000). HOW we cut changed: blind head-truncation amputated
+    The default cap mirrors the original access_score.ipynb scoring loop
+    (MAX_CHARS = 300_000); the primary extraction path passes the much larger
+    PRIMARY_MAX_CHARS (DeepSeek v4-pro's 1M-token context does not need the
+    scoring cap). HOW we cut changed: blind head-truncation amputated
     the per-drug criteria modules that big payer documents keep DEEP in the file
     (observed live: a 705k-char / 90-page policy whose criteria sat at pages
     45-71 → all-NA extraction for every brand; the original pipeline only
@@ -141,8 +145,10 @@ def _truncate_policy_text(policy_text: str, filename: str = "", brand: str = "")
     remains the fallback when the brand never appears beyond the head — there
     is no better text to choose in that case.
     """
+    if cap is None:
+        cap = SCORING_MAX_CHARS
     _TRUNCATION_STATE.mode = None
-    if len(policy_text) <= SCORING_MAX_CHARS:
+    if len(policy_text) <= cap:
         return policy_text
 
     head_end = min(WINDOW_HEAD_CHARS, len(policy_text))
@@ -158,8 +164,8 @@ def _truncate_policy_text(policy_text: str, filename: str = "", brand: str = "")
         _TRUNCATION_STATE.mode = "head"
         log.info("truncating policy text for %s | %s: %d -> %d chars "
                  "(head; no alias windows beyond the head)",
-                 filename, brand, len(policy_text), SCORING_MAX_CHARS)
-        return policy_text[:SCORING_MAX_CHARS]
+                 filename, brand, len(policy_text), cap)
+        return policy_text[:cap]
 
     intervals.append([0, head_end])
     intervals.sort()
@@ -177,7 +183,7 @@ def _truncate_policy_text(policy_text: str, filename: str = "", brand: str = "")
     pieces, total = [], 0
     for start, end in merged:
         gap_cost = len(gap) if pieces else 0
-        room = SCORING_MAX_CHARS - total - gap_cost
+        room = cap - total - gap_cost
         if room <= 0:
             break
         chunk = policy_text[start:end][:room]
@@ -205,6 +211,16 @@ DEFAULT_CONFIDENCE_RUNS = int(os.environ.get("CONFIDENCE_RUNS", "1"))
 # every model call; we restore that cap and apply it before BOTH the extraction
 # call and the access-scoring call (env-overridable, default unchanged).
 SCORING_MAX_CHARS = int(os.environ.get("SCORING_MAX_CHARS", "300000"))
+# Cap for the PRIMARY model's inputs (extraction + the source-span pass).
+# DeepSeek v4-pro has a 1,048,576-token context (verified June 2026), so the
+# primary path does NOT need the notebook's 300k-char scoring cap that briefly
+# (and wrongly) bounded it: 3.2M chars ≈ ~800k tokens leaves headroom for
+# prompts + output inside the 1M window. This restores the ORIGINAL pipeline's
+# shape — extraction saw the full document (Gemini 1M ctx), only the scoring
+# loop truncated to 300k. Cost note: v4-pro cache-miss input ≈ $0.435/M tokens
+# and repeated same-document calls hit DeepSeek's prefix cache (≈$0.0036/M),
+# so a 705k-char document costs ~$0.08 on the first call and cents after.
+PRIMARY_MAX_CHARS = int(os.environ.get("PRIMARY_MAX_CHARS", "3200000"))
 # Brand-aware window packing knobs for over-cap documents (see
 # _truncate_policy_text). HEAD keeps the document preamble (title / indication
 # tables / global criteria that apply to every drug); BEFORE/AFTER bracket each
@@ -742,13 +758,23 @@ def analyze_brand(doc, md_text: str, brand: str, filename: str = "",
         "reduction_pct": reduction_pct,
     })
 
-    # Restore the validated original's 300k cap (access_score.ipynb MAX_CHARS):
-    # truncate ONCE here, before any model sees the text, so the extraction call,
-    # the access-scoring call and the consensus validators are all bounded.
-    # Over-cap documents are brand-aware window packed (see _truncate_policy_text);
-    # the mode is surfaced in meta so a capped input is always observable.
-    policy_text = _truncate_policy_text(policy_text, filename, brand)
+    # Two-tier caps, mirroring the ORIGINAL pipeline's shape:
+    #   * PRIMARY (extraction + spans + the stored policy_text): the original
+    #     extracted over the FULL document (Gemini 1M ctx). DeepSeek v4-pro also
+    #     has a 1M-token window, so the primary path is bounded only by the very
+    #     large PRIMARY_MAX_CHARS guard (window-packed if ever exceeded).
+    #   * SCORING + VALIDATORS: the original scoring loop truncated to 300k
+    #     (access_score.ipynb MAX_CHARS) — preserved as SCORING_MAX_CHARS — and
+    #     the Workers AI validators have 128k-token contexts that a 300k-char
+    #     window-packed input fits. Packing beats the original's blind head-cut:
+    #     the kept text is brand-relevant, so scoring sees the drug's criteria.
+    # Both caps are observable in meta (truncation / scoring_truncation modes).
+    policy_text = _truncate_policy_text(policy_text, filename, brand,
+                                        cap=PRIMARY_MAX_CHARS)
     truncation_mode = consume_truncation_mode()
+    policy_scoring = _truncate_policy_text(policy_text, filename, brand,
+                                           cap=SCORING_MAX_CHARS)
+    scoring_truncation_mode = consume_truncation_mode()
 
     # ── W3 3-MODEL consensus: kick off EACH validator's extraction IN PARALLEL
     # with the primary runs below (and with each other). DeepSeek stays the
@@ -766,7 +792,12 @@ def analyze_brand(doc, md_text: str, brand: str, filename: str = "",
         def _validator_work(model_id):
             sec_rows = []
             for _ in range(runs):
-                params = _extract_params_secondary(policy_text, brand, model=model_id)
+                # Validators get the window-packed SCORING text: Workers AI
+                # models have 128k-token contexts the full primary text can
+                # exceed. The packed text keeps the brand-relevant sections, so
+                # the consensus comparison stays meaningful despite the
+                # primary/validator input asymmetry on huge documents.
+                params = _extract_params_secondary(policy_scoring, brand, model=model_id)
                 sec_rows.append({col: fn({"filename": filename, "brand": brand}, params)
                                  for col, fn in CSV_COLUMNS})
             # Per-field majority across THIS validator's runs (earliest-run
@@ -807,9 +838,10 @@ def analyze_brand(doc, md_text: str, brand: str, filename: str = "",
         run_row = {col: _coerce_cell(fn({"filename": filename, "brand": brand}, params))
                    for col, fn in CSV_COLUMNS}
 
-        # Stage 4: access scoring (verbatim prompt + boundary check).
+        # Stage 4: access scoring (verbatim prompt + boundary check). Scoring
+        # keeps the notebook's own 300k cap (window-packed, see above).
         t0 = time.time()
-        run_score, run_just = _access_score(run_row, policy_text, brand)
+        run_score, run_just = _access_score(run_row, policy_scoring, brand)
         score_ms_total += int((time.time() - t0) * 1000)
         run_row["Access Score"] = run_score
 
@@ -872,12 +904,16 @@ def analyze_brand(doc, md_text: str, brand: str, filename: str = "",
             "full_markdown_chars": full_md_chars,
             "reduced_chars": reduced_chars,
             "reduction_pct": reduction_pct,
-            # None when the (reduced) text fit under SCORING_MAX_CHARS;
-            # "alias-windowed" | "head" when the cap fired. llm_input_chars is
-            # the length the models actually saw (reduced_chars is PRE-cap —
-            # the two differing is exactly the capped case).
+            # None when the text fit under the respective cap; "alias-windowed"
+            # | "head" when a cap fired. *_input_chars are the lengths each
+            # consumer actually saw (reduced_chars is PRE-cap — differing is
+            # exactly the capped case). truncation = primary (extraction/spans,
+            # PRIMARY_MAX_CHARS); scoring_truncation = scoring + validators
+            # (SCORING_MAX_CHARS).
             "truncation": truncation_mode,
             "llm_input_chars": len(policy_text),
+            "scoring_truncation": scoring_truncation_mode,
+            "scoring_input_chars": len(policy_scoring),
             "timings_ms": timings,
             "model": llm.MODEL_ID,
             "runs": runs,

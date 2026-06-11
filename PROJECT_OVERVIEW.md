@@ -237,8 +237,10 @@ verbatim-loaded definitions at runtime with deliberate accuracy deltas — a cas
 (provably dead) `\bPsO\b` relevance pattern, a two-sided relevance guard (an implausible reduction falls back to the
 full text), an extended coverage-field check that abstains-and-flags instead of clamping an uncovered-looking row's
 positive score to 0, and named env-overridable thresholds (`REDUCER_PASSTHROUGH_CHARS`, default 100000;
-`SCORING_MAX_CHARS`, default 300000). The notebook files stay byte-identical; the README's "Override layer" section
-lists each divergence.
+`SCORING_MAX_CHARS`, default 300000 for scoring + the 128k-ctx consensus validators; `PRIMARY_MAX_CHARS`, default
+3200000 for the 1M-token-context primary's extraction/spans inputs). Oversized documents are brand-aware window
+packed (head + alias windows), never blindly head-truncated. The notebook files stay byte-identical; the README's
+"Override layer" section lists each divergence.
 
 ---
 
@@ -385,7 +387,8 @@ pa-policy-extractor/
 - **LLM nondeterminism**: outputs vary slightly run-to-run (as the original documented). DeepSeek v4-pro ≠ Gemini, so
   exact values can differ from the original locked run.
 - **CPU OCR is slow** with cold starts (no GPU); large/long PDFs can approach request limits (20 MB per-PDF cap,
-  100 MB total per batch upload; long docs may be truncated for the LLM as the original did — see `SCORING_MAX_CHARS`).
+  100 MB total per batch upload; very long docs are brand-aware window packed for the LLM past the input guards — see
+  `PRIMARY_MAX_CHARS` / `SCORING_MAX_CHARS`).
 - This is a **re-host, not the original GPU pipeline** — same logic, CPU-bound, demo-scale.
 
 ---

@@ -75,11 +75,21 @@ export interface Env {
   REDUCER_PASSTHROUGH_CHARS?: string;
 
   /**
-   * Override-layer tunable: max policy-text chars sent to the LLM for
-   * extraction/scoring (restores the validated original's 300k cap). Default
+   * Pipeline tunable: max policy-text chars for the SCORING call and the
+   * Workers AI consensus validators (the validated original's scoring-loop
+   * 300k cap; 128k-token validator contexts fit this window-packed). Default
    * "300000".
    */
   SCORING_MAX_CHARS?: string;
+
+  /**
+   * Pipeline tunable: max policy-text chars for the PRIMARY model's
+   * extraction + source-span inputs. DeepSeek v4-pro has a 1M-token context,
+   * so this guard is far above the scoring cap — the primary path sees the
+   * (near-)full document; over-cap text is brand-aware window packed. Default
+   * "3200000".
+   */
+  PRIMARY_MAX_CHARS?: string;
 
   // --- Persistent-library retention (#3) --------------------------------------
 

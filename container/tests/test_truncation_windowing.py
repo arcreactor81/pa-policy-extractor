@@ -126,3 +126,19 @@ def test_consume_truncation_mode_resets(monkeypatch):
     core._truncate_policy_text("x" * 250, "p.pdf", "STELARA")
     assert core.consume_truncation_mode() == "head"
     assert core.consume_truncation_mode() is None
+
+
+# ── explicit cap argument (two-tier: PRIMARY vs SCORING) ─────────────────────
+def test_explicit_cap_overrides_default(monkeypatch):
+    _pin(monkeypatch, cap=100)  # SCORING_MAX_CHARS pinned to 100
+    text = "x" * 250
+    # Same text: default cap truncates, an explicit larger cap passes through.
+    assert core._truncate_policy_text(text, "p.pdf", "STELARA", cap=300) is text
+    assert core.consume_truncation_mode() is None
+    assert len(core._truncate_policy_text(text, "p.pdf", "STELARA")) == 100
+
+
+def test_primary_cap_is_above_scoring_cap():
+    # The two-tier contract: extraction/spans (PRIMARY, 1M-token DeepSeek ctx)
+    # must never be bounded tighter than scoring/validators.
+    assert core.PRIMARY_MAX_CHARS > core.SCORING_MAX_CHARS

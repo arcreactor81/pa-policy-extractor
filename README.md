@@ -218,7 +218,8 @@ VALIDATOR_MODELS                           # consensus validator list (CSV of @c
 SECONDARY_MODEL                            # legacy single-validator id (compat)
 CONFIDENCE_RUNS                            # default extraction repeats when `runs` is omitted (default "1" — interactive fast path; Deep-Confidence/batch send runs=3 explicitly)
 REDUCER_PASSTHROUGH_CHARS                  # reducer full-document passthrough threshold (default "100000")
-SCORING_MAX_CHARS                          # policy-text cap fed to access scoring (default "300000")
+SCORING_MAX_CHARS                          # policy-text cap for scoring + consensus validators (default "300000")
+PRIMARY_MAX_CHARS                          # policy-text guard for primary extraction/spans (default "3200000"; DeepSeek v4-pro has a 1M-token context)
 ```
 
 `LIBRARY_RETENTION_DAYS` and `RETENTION_DAYS` are read by the **Worker** (D1/R2 pruning + batch cleanup), not the container, so they are not in this forwarded set.
@@ -264,7 +265,8 @@ The notebook files themselves are never edited — every accuracy fix is applied
 - **PsO regex case fix** — the reducer's bare `\bPsO\b` relevance pattern is case-sensitive in the original (unlike its `psoriasis` siblings), which makes it provably dead against the lowercased text the reducer strategies actually search; the override re-compiles it case-insensitively so `pso` matches.
 - **Two-sided relevance guard** — the reducer's output is now sanity-checked from the other side too: a reduced text that lacks the brand, a PsO keyword, or any criteria language is rejected in favour of the full document text (the fallback is observable in the result as `source: "relevance-fallback"`).
 - **Clamp → abstain** — the deterministic coverage-boundary check judges coverage over an **extended set of coverage fields** (the original's fields plus Age, Quantity Limits, and the Reauthorization columns), and an apparently-uncovered row with a positive model score is no longer clamped to 0: the model's score is preserved and the row is **flagged for review** (an all-NA extraction could equally be an extraction miss on a covered policy).
-- **Named thresholds** — the reduce/score magic numbers are lifted into named, env-overridable knobs: `REDUCER_PASSTHROUGH_CHARS` (default `100000` — documents shorter than this skip reduction and pass through whole, as the original did) and `SCORING_MAX_CHARS` (default `300000` — the original scoring loop's policy-text truncation, now applied before both the extraction and the scoring calls).
+- **Named thresholds** — the reduce/score magic numbers are lifted into named, env-overridable knobs: `REDUCER_PASSTHROUGH_CHARS` (default `100000` — documents shorter than this skip reduction and pass through whole, as the original did), `SCORING_MAX_CHARS` (default `300000` — the original scoring loop's policy-text cap, applied to the scoring call and the Workers AI consensus validators, whose 128k-token contexts it fits), and `PRIMARY_MAX_CHARS` (default `3200000` — the guard on the primary model's extraction/source-span inputs; DeepSeek v4-pro's 1M-token context means extraction sees the (near-)full document, exactly as the original did on Gemini's 1M window).
+- **Brand-aware window packing** — when a cap fires on an oversized document, the kept text is the document head plus windows around every brand-alias mention (merged in document order) rather than a blind head-cut: blind truncation amputated the per-drug criteria modules that big payer documents keep deep in the file. The applied mode is observable per brand in `meta.truncation` / `meta.scoring_truncation` (`null` | `"alias-windowed"` | `"head"`).
 
 ## Limitations
 

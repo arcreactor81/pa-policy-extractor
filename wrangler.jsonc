@@ -138,10 +138,16 @@
     // at "1" so interactive uploads stay fast/cheap (the UI's Deep-Confidence
     // toggle sends runs=3 explicitly; batch jobs also send runs explicitly).
     // REDUCER_PASSTHROUGH_CHARS / SCORING_MAX_CHARS: override-layer thresholds
-    // (reducer passthrough gate; LLM input truncation matching the validated original).
+    // (reducer passthrough gate; scoring+validator input cap matching the
+    // validated original's scoring loop). PRIMARY_MAX_CHARS: the much larger
+    // guard for the primary model's extraction/spans inputs — DeepSeek v4-pro
+    // has a 1M-token context, so the primary path sees the (near-)full document
+    // exactly like the original did on Gemini's 1M window; over-cap documents
+    // are brand-aware window packed, never blind head-truncated.
     "CONFIDENCE_RUNS": "1",
     "REDUCER_PASSTHROUGH_CHARS": "100000",
     "SCORING_MAX_CHARS": "300000",
+    "PRIMARY_MAX_CHARS": "3200000",
 
     // Layer 3 (async/batch jobs) — subscription-bounded caps:
     //   MAX_PDFS_PER_JOB    — hard cap on PDFs per job.
