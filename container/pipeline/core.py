@@ -89,17 +89,106 @@ def _wrap_policy(policy_text: str) -> str:
     return f"{_POLICY_OPEN}\n{policy_text}\n{_POLICY_CLOSE}"
 
 
+# Per-thread record of HOW the last _truncate_policy_text call shrank its input
+# (None | "head" | "alias-windowed"). Same consume-once pattern as the override
+# layer's relevance-fallback flag: the helper runs deep in the call chain and
+# returns only text, so observability rides a thread-local that analyze_brand
+# consumes immediately after the call (same thread).
+_TRUNCATION_STATE = threading.local()
+
+
+def consume_truncation_mode():
+    """Mode of the most recent _truncate_policy_text call on THIS thread
+    (consume-once; None when the text fit under the cap)."""
+    mode = getattr(_TRUNCATION_STATE, "mode", None)
+    _TRUNCATION_STATE.mode = None
+    return mode
+
+
+def _brand_alias_patterns(brand: str):
+    """Word-boundary regexes for the brand + its reducer aliases (generic /
+    suffixed names matter: deep criteria modules often use 'adalimumab-atto',
+    not 'Amjevita'). Falls back to the bare brand if the namespace is absent."""
+    aliases = [brand]
+    try:
+        reducer_aliases = _namespaces()["reducer"]["BRAND_ALIASES"]
+        aliases = list(reducer_aliases.get(brand.upper(), [])) or [brand]
+    except Exception:  # noqa: BLE001 — alias lookup must never break truncation
+        pass
+    pats = []
+    for alias in aliases:
+        alias = str(alias).strip()
+        if alias:
+            pats.append(re.compile(
+                r"(?<![A-Za-z0-9])" + re.escape(alias) + r"(?![A-Za-z0-9])",
+                re.IGNORECASE))
+    return pats
+
+
 def _truncate_policy_text(policy_text: str, filename: str = "", brand: str = "") -> str:
     """Cap the policy text at SCORING_MAX_CHARS before any LLM call.
 
-    Mirrors the original access_score.ipynb scoring loop (MAX_CHARS = 300_000).
-    Logs whenever the cap actually fires so oversized documents are observable.
+    The cap itself mirrors the original access_score.ipynb scoring loop
+    (MAX_CHARS = 300_000). HOW we cut changed: blind head-truncation amputated
+    the per-drug criteria modules that big payer documents keep DEEP in the file
+    (observed live: a 705k-char / 90-page policy whose criteria sat at pages
+    45-71 → all-NA extraction for every brand; the original pipeline only
+    survived such documents because Gemini's 1M context never needed the cap on
+    the extraction call). Over-cap documents are now BRAND-AWARE WINDOW PACKED:
+    keep the document head (title / indication tables / global criteria), plus
+    a window around every brand-alias mention (criteria modules FOLLOW the drug
+    name), merged in document order until the budget is spent. Head-truncation
+    remains the fallback when the brand never appears beyond the head — there
+    is no better text to choose in that case.
     """
+    _TRUNCATION_STATE.mode = None
     if len(policy_text) <= SCORING_MAX_CHARS:
         return policy_text
-    log.info("truncating policy text for %s | %s: %d -> %d chars",
-             filename, brand, len(policy_text), SCORING_MAX_CHARS)
-    return policy_text[:SCORING_MAX_CHARS]
+
+    head_end = min(WINDOW_HEAD_CHARS, len(policy_text))
+    intervals = []
+    for pat in _brand_alias_patterns(brand):
+        for m in pat.finditer(policy_text):
+            intervals.append([max(0, m.start() - WINDOW_BEFORE_CHARS),
+                              min(len(policy_text), m.end() + WINDOW_AFTER_CHARS)])
+
+    if not intervals or all(end <= head_end for _, end in intervals):
+        # No brand evidence beyond the head — the head IS the best cap-sized
+        # slice (the original behavior).
+        _TRUNCATION_STATE.mode = "head"
+        log.info("truncating policy text for %s | %s: %d -> %d chars "
+                 "(head; no alias windows beyond the head)",
+                 filename, brand, len(policy_text), SCORING_MAX_CHARS)
+        return policy_text[:SCORING_MAX_CHARS]
+
+    intervals.append([0, head_end])
+    intervals.sort()
+    merged = [intervals[0]]
+    for start, end in intervals[1:]:
+        if start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+
+    # Assemble in document order under the budget. Document order (not
+    # relevance-ranked) keeps the head first and preserves the policy's own
+    # narrative flow for the LLM; the gap marker tells the model text was cut.
+    gap = "\n\n[... unrelated policy sections omitted ...]\n\n"
+    pieces, total = [], 0
+    for start, end in merged:
+        gap_cost = len(gap) if pieces else 0
+        room = SCORING_MAX_CHARS - total - gap_cost
+        if room <= 0:
+            break
+        chunk = policy_text[start:end][:room]
+        pieces.append(chunk)
+        total += gap_cost + len(chunk)
+    packed = gap.join(pieces)
+    _TRUNCATION_STATE.mode = "alias-windowed"
+    log.info("window-packed policy text for %s | %s: %d -> %d chars "
+             "(%d merged windows, head=%d)",
+             filename, brand, len(policy_text), len(packed), len(merged), head_end)
+    return packed
 
 # The 13 deliverable columns we aggregate confidence over: the 12 extraction
 # columns (FINAL_COLUMNS minus the non-clinical Filename/Brand) plus Access Score.
@@ -116,6 +205,14 @@ DEFAULT_CONFIDENCE_RUNS = int(os.environ.get("CONFIDENCE_RUNS", "1"))
 # every model call; we restore that cap and apply it before BOTH the extraction
 # call and the access-scoring call (env-overridable, default unchanged).
 SCORING_MAX_CHARS = int(os.environ.get("SCORING_MAX_CHARS", "300000"))
+# Brand-aware window packing knobs for over-cap documents (see
+# _truncate_policy_text). HEAD keeps the document preamble (title / indication
+# tables / global criteria that apply to every drug); BEFORE/AFTER bracket each
+# brand-alias mention — generous AFTER because per-drug criteria modules follow
+# the drug-name heading in payer documents.
+WINDOW_HEAD_CHARS = int(os.environ.get("WINDOW_HEAD_CHARS", "40000"))
+WINDOW_BEFORE_CHARS = int(os.environ.get("WINDOW_BEFORE_CHARS", "5000"))
+WINDOW_AFTER_CHARS = int(os.environ.get("WINDOW_AFTER_CHARS", "20000"))
 # Whether the source-span explainability pass runs by default.
 DEFAULT_SOURCE_SPANS = str(os.environ.get("SOURCE_SPANS", "true")).strip().lower() not in (
     "0", "false", "no", "off", "",
@@ -648,7 +745,10 @@ def analyze_brand(doc, md_text: str, brand: str, filename: str = "",
     # Restore the validated original's 300k cap (access_score.ipynb MAX_CHARS):
     # truncate ONCE here, before any model sees the text, so the extraction call,
     # the access-scoring call and the consensus validators are all bounded.
+    # Over-cap documents are brand-aware window packed (see _truncate_policy_text);
+    # the mode is surfaced in meta so a capped input is always observable.
     policy_text = _truncate_policy_text(policy_text, filename, brand)
+    truncation_mode = consume_truncation_mode()
 
     # ── W3 3-MODEL consensus: kick off EACH validator's extraction IN PARALLEL
     # with the primary runs below (and with each other). DeepSeek stays the
@@ -772,6 +872,12 @@ def analyze_brand(doc, md_text: str, brand: str, filename: str = "",
             "full_markdown_chars": full_md_chars,
             "reduced_chars": reduced_chars,
             "reduction_pct": reduction_pct,
+            # None when the (reduced) text fit under SCORING_MAX_CHARS;
+            # "alias-windowed" | "head" when the cap fired. llm_input_chars is
+            # the length the models actually saw (reduced_chars is PRE-cap —
+            # the two differing is exactly the capped case).
+            "truncation": truncation_mode,
+            "llm_input_chars": len(policy_text),
             "timings_ms": timings,
             "model": llm.MODEL_ID,
             "runs": runs,
