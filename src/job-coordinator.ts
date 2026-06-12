@@ -17,8 +17,11 @@
  *   4. When all PDFs finish, the aggregated results are written to R2
  *      (results/<jobId>.json), the job is marked complete, and a terminal
  *      {"event":"job_done", ...} event is emitted.
- *   5. A retention alarm (RETENTION_DAYS, default 7) eventually deletes the
- *      job's R2 objects + this DO's storage. The alarm is idempotent.
+ *   5. The DO's single alarm slot is multiplexed: while the job is NON-terminal
+ *      it is a short-cadence WATCHDOG that resumes processing orphaned by a DO
+ *      restart (processing rides waitUntil, which restarts silently kill);
+ *      once terminal it becomes the retention alarm (RETENTION_DAYS, default 7)
+ *      that deletes the job's R2 objects + this DO's storage. Idempotent.
  *
  * WebSocket streaming uses the HIBERNATION API (acceptWebSocket /
  * getWebSockets / serializeAttachment) so an idle job bills zero duration while
@@ -200,9 +203,42 @@ export function pdfOutcomeAfterDone(resultCount: number): {
   return { status: "complete" };
 }
 
+/**
+ * Watchdog cadence while a job is non-terminal. Processing rides a single
+ * ctx.waitUntil promise, which a DO restart (deploy, eviction, crash) silently
+ * orphans — observed live: a job sat status="running" / PDF "pending" for hours
+ * because the only alarm was retention, days away. While non-terminal, the
+ * alarm slot is a short-cadence watchdog that resumes orphaned processing;
+ * only a TERMINAL job schedules the retention alarm.
+ */
+const WATCHDOG_MS = 3 * 60 * 1000;
+
+/**
+ * Idle guard on the container NDJSON stream. The container heartbeats every
+ * few seconds even mid-OCR, so a read that delivers nothing for this long is a
+ * dead instance (e.g. restarted mid-stream) — fail the PDF instead of awaiting
+ * a body that will never end.
+ */
+const STREAM_IDLE_MS = 180 * 1000;
+
+/**
+ * Abandon ceiling: a job still non-terminal this long after creation has been
+ * resurrected repeatedly without converging (instance churn, persistent
+ * container failure). Mark it failed so pollers see a terminal state instead
+ * of an eternal "running".
+ */
+const MAX_JOB_AGE_MS = 12 * 60 * 60 * 1000;
+
 export class JobCoordinator extends DurableObject<Env> {
   /** In-memory next seq_num cache; rehydrated from SQLite lazily (see nextSeq). */
   private seqCursor: number | null = null;
+
+  /**
+   * True while THIS instance has a processing run in flight (waitUntil). Purely
+   * in-memory by design: a restarted instance starts false, which is exactly
+   * the signal the watchdog alarm uses to detect orphaned processing.
+   */
+  private processing = false;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -315,8 +351,9 @@ export class JobCoordinator extends DurableObject<Env> {
   }
 
   /**
-   * Record the job + per-PDF rows, schedule the retention alarm, and kick off
-   * processing in the background (waitUntil so the 202 returns immediately).
+   * Record the job + per-PDF rows, arm the WATCHDOG alarm (retention is
+   * scheduled by runJob once the job is terminal), and kick off processing in
+   * the background (waitUntil so the 202 returns immediately).
    */
   private handleStart(body: StartJobBody): Response {
     const sql = this.ctx.storage.sql;
@@ -372,16 +409,15 @@ export class JobCoordinator extends DurableObject<Env> {
       );
     }
 
-    // Retention alarm: delete this job's data RETENTION_DAYS from now.
-    const retentionDays = Number(this.env.RETENTION_DAYS ?? "7") || 7;
-    void this.ctx.storage.setAlarm(
-      createdAt + retentionDays * 24 * 60 * 60 * 1000
-    );
+    // WATCHDOG alarm (not retention): while the job is non-terminal the alarm
+    // slot guards against a DO restart orphaning the waitUntil-driven
+    // processing below. runJob schedules the retention alarm once terminal.
+    void this.ctx.storage.setAlarm(createdAt + WATCHDOG_MS);
 
     // Process in the background so the control-plane call returns instantly.
     // waitUntil keeps the DO alive until processing finishes even though fetch
     // has returned.
-    this.ctx.waitUntil(this.processJob(body.jobId, config));
+    this.ctx.waitUntil(this.runJob(body.jobId, config));
 
     return new Response(JSON.stringify({ ok: true }), {
       headers: { "content-type": "application/json" },
@@ -389,6 +425,39 @@ export class JobCoordinator extends DurableObject<Env> {
   }
 
   // ── Job processing (semaphore + container fan-out) ──────────────────────────
+
+  /**
+   * processJob wrapper owning the `processing` flag and the alarm handoff:
+   * while running, the watchdog alarm sees processing=true and stays hands-off;
+   * once the job is terminal, the alarm slot is repurposed for retention.
+   */
+  private async runJob(jobId: string, config: JobConfig): Promise<void> {
+    if (this.processing) return; // belt-and-braces: never double-drive
+    this.processing = true;
+    try {
+      await this.processJob(jobId, config);
+    } finally {
+      this.processing = false;
+      // Terminal (finalizeJob ran, even on the all-failed path): hand the alarm
+      // slot to retention. On an unexpected throw the job may still be
+      // non-terminal — the watchdog scheduled by alarm()/handleStart resumes it.
+      const rows = this.ctx.storage.sql
+        .exec<{ status: string; created_at: number }>(
+          "SELECT status, created_at FROM jobs WHERE id = ?",
+          jobId
+        )
+        .toArray();
+      if (rows.length && (rows[0].status === "complete" || rows[0].status === "failed")) {
+        const retentionDays = Number(this.env.RETENTION_DAYS ?? "7") || 7;
+        void this.ctx.storage.setAlarm(
+          Math.max(
+            Date.now() + 1000,
+            rows[0].created_at + retentionDays * 24 * 60 * 60 * 1000
+          )
+        );
+      }
+    }
+  }
 
   /**
    * Drive every PDF through the container with a bounded concurrency semaphore,
@@ -400,8 +469,18 @@ export class JobCoordinator extends DurableObject<Env> {
       Number(this.env.MAX_CONCURRENT_PDFS ?? "2") || 2
     );
 
-    // Simple promise-pool semaphore: keep `maxConcurrent` PDFs in flight.
-    const queue = [...config.pdfs];
+    // RESUME-SAFE queue: only PDFs not already terminal. On a fresh start that
+    // is every PDF; on a watchdog resume after a DO restart, completed/failed
+    // PDFs keep their state and only the orphaned ones re-run.
+    const terminal = new Set(
+      this.ctx.storage.sql
+        .exec<{ pdf_index: number }>(
+          "SELECT pdf_index FROM job_pdfs WHERE status IN ('complete','failed')"
+        )
+        .toArray()
+        .map((r) => r.pdf_index)
+    );
+    const queue = config.pdfs.filter((p) => !terminal.has(p.index));
     const workers: Promise<void>[] = [];
     const runNext = async (): Promise<void> => {
       for (;;) {
@@ -571,7 +650,27 @@ export class JobCoordinator extends DurableObject<Env> {
     };
 
     for (;;) {
-      const { done, value } = await reader.read();
+      // Idle guard: the container heartbeats every few seconds, so a read that
+      // stays pending past STREAM_IDLE_MS means the instance died mid-stream
+      // (observed live during a restart). Fail the PDF instead of awaiting a
+      // body that never ends — the watchdog/caller error path takes over.
+      let idleTimer: ReturnType<typeof setTimeout> | undefined;
+      const idle = new Promise<never>((_, reject) => {
+        idleTimer = setTimeout(
+          () => reject(new Error(`container stream stalled (no data for ${STREAM_IDLE_MS / 1000}s)`)),
+          STREAM_IDLE_MS
+        );
+      });
+      let done = false;
+      let value: Uint8Array | undefined;
+      try {
+        ({ done, value } = await Promise.race([reader.read(), idle]));
+      } catch (err) {
+        void reader.cancel().catch(() => {});
+        throw err;
+      } finally {
+        clearTimeout(idleTimer);
+      }
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
 
@@ -973,6 +1072,18 @@ export class JobCoordinator extends DurableObject<Env> {
     const job = jobRows[0];
     const config = JSON.parse(job.config_json) as JobConfig;
 
+    // Poll-triggered self-heal: if the job is non-terminal but no processing
+    // run is alive in this instance (orphaned by a DO restart), pull the
+    // watchdog alarm forward so recovery starts in seconds, not minutes —
+    // someone polling a stuck job is exactly the moment to fix it.
+    if (
+      job.status !== "complete" &&
+      job.status !== "failed" &&
+      !this.processing
+    ) {
+      void this.ctx.storage.setAlarm(Date.now() + 5_000);
+    }
+
     const pdfRows = sql
       .exec<{
         pdf_index: number;
@@ -1129,18 +1240,35 @@ export class JobCoordinator extends DurableObject<Env> {
     // Errored sockets are dropped by the runtime; nothing to do.
   }
 
-  // ── Retention alarm (idempotent) ────────────────────────────────────────────
+  // ── Alarm dispatcher: watchdog (non-terminal) / retention (terminal) ────────
 
   /**
-   * Delete this job's R2 objects (pdfs/<jobId>/*, results/<jobId>.json) and then
-   * the DO's own storage. Idempotent: a partial failure reschedules the alarm
-   * so deletion is retried; a fully-deleted job re-running the alarm is a no-op.
+   * One alarm slot, two duties.
+   *
+   * NON-TERMINAL job: this is the WATCHDOG. Processing rides a waitUntil
+   * promise that a DO restart silently orphans (observed live: status
+   * "running", PDF "pending", forever). If no processing run is alive in this
+   * instance, resume it (resetting orphaned per-PDF counters so re-streamed
+   * results don't double-count); past MAX_JOB_AGE_MS, abandon to a terminal
+   * failed state instead. Either way, re-arm the watchdog — runJob hands the
+   * slot to retention when the job lands terminal.
+   *
+   * TERMINAL job: retention. Before the retention timestamp, just re-arm for
+   * it (covers legacy alarms and watchdog->retention handoff races); after it,
+   * delete the job's R2 objects + this DO's storage. Idempotent: a partial
+   * failure reschedules; a fully-deleted job re-running is a no-op.
    */
   override async alarm(): Promise<void> {
     try {
       const jobRows = this.ctx.storage.sql
-        .exec<{ id: string; total_pdfs: number }>(
-          "SELECT id, total_pdfs FROM jobs LIMIT 1"
+        .exec<{
+          id: string;
+          total_pdfs: number;
+          status: string;
+          created_at: number;
+          config_json: string;
+        }>(
+          "SELECT id, total_pdfs, status, created_at, config_json FROM jobs LIMIT 1"
         )
         .toArray();
 
@@ -1149,6 +1277,44 @@ export class JobCoordinator extends DurableObject<Env> {
         return;
       }
       const { id: jobId, total_pdfs } = jobRows[0];
+      const row = jobRows[0];
+
+      const isTerminal = row.status === "complete" || row.status === "failed";
+      if (!isTerminal) {
+        if (!this.processing) {
+          if (Date.now() - row.created_at > MAX_JOB_AGE_MS) {
+            // Abandon: repeated resurrection never converged. Terminal state so
+            // pollers stop seeing an eternal "running".
+            this.ctx.storage.sql.exec(
+              "UPDATE jobs SET status = 'failed' WHERE id = ?",
+              jobId
+            );
+            this.ctx.storage.sql.exec(
+              "UPDATE job_pdfs SET status = 'failed', error = COALESCE(error, 'abandoned: job never completed (instance churn)') WHERE status NOT IN ('complete','failed')"
+            );
+          } else {
+            // Orphaned processing — resume. Reset the counters of every
+            // non-terminal PDF first: a partially-streamed PDF re-runs from
+            // scratch, and its prior `result` events must not double-count.
+            console.log(`watchdog: resuming orphaned job ${jobId}`);
+            this.ctx.storage.sql.exec(
+              "UPDATE job_pdfs SET results = 0, error = NULL WHERE status NOT IN ('complete','failed')"
+            );
+            const config = JSON.parse(row.config_json) as JobConfig;
+            this.ctx.waitUntil(this.runJob(jobId, config));
+          }
+        }
+        void this.ctx.storage.setAlarm(Date.now() + WATCHDOG_MS);
+        return;
+      }
+
+      // Terminal: retention duty. Not yet due -> re-arm for the real deadline.
+      const retentionDays = Number(this.env.RETENTION_DAYS ?? "7") || 7;
+      const retentionAt = row.created_at + retentionDays * 24 * 60 * 60 * 1000;
+      if (Date.now() < retentionAt) {
+        void this.ctx.storage.setAlarm(retentionAt);
+        return;
+      }
 
       // Delete every staged PDF and the results doc from R2. R2 delete on a
       // missing key is a no-op, so re-running is safe.
