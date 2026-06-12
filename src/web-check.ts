@@ -40,6 +40,11 @@
 import { WorkflowEntrypoint } from "cloudflare:workers";
 import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
 import type { Env } from "../worker-configuration";
+// Knowledge digest (the advisory "Ask" corpus): the persist step ALSO writes a
+// markdown digest of the verdict to the pa-knowledge R2 bucket. Best-effort —
+// writeDigest never throws and the call is additionally caught, so a digest
+// failure can never fail the persist step (the verdict doc always lands).
+import { buildWebCheckDigest, digestKey, writeDigest } from "./knowledge";
 
 /** The Workflow instance payload (what POST /api/webcheck validates + sends). */
 export interface WebCheckParams {
@@ -368,6 +373,20 @@ export class WebCheckWorkflow extends WorkflowEntrypoint<Env, WebCheckParams> {
         JSON.stringify(doc),
         { httpMetadata: { contentType: "application/json" } }
       );
+
+      // Knowledge digest (advisory "Ask" corpus) — AFTER the verdict doc put,
+      // inside the same step, NON-FATAL by construction: writeDigest never
+      // throws and the builder is caught too, so the persist step's durable
+      // success is decided solely by the verdict put above.
+      try {
+        await writeDigest(
+          this.env,
+          digestKey(owner, sha, brand, "webcheck"),
+          buildWebCheckDigest(doc)
+        );
+      } catch (err) {
+        console.error("webcheck knowledge digest failed (ignored):", err);
+      }
     });
   }
 

@@ -52,6 +52,13 @@ import {
   parseExplain,
   verifyAccessJwt,
 } from "./util";
+// Knowledge digests (the advisory "Ask" corpus): every successful library save
+// ALSO writes one markdown digest per saved result to the pa-knowledge R2
+// bucket. Best-effort by contract — writeAnalysisDigests never rejects, so the
+// hook below can never break a save. (knowledge.ts imports ensureLibrarySchema
+// back from this module; the cycle is benign — both edges are function-body
+// references only, never module-evaluation-time.)
+import { writeAnalysisDigests } from "./knowledge";
 
 /** Cloudflare Access identity header carrying the authenticated user email. */
 const OWNER_HEADER = "cf-access-authenticated-user-email";
@@ -380,11 +387,22 @@ async function ownerOr401(
  * POST /api/library — body JSON { kind, job_id?, file_sha256, runs, explain,
  * results:[<ExtractResult>...] }. Owner-scoped. Saves each result to R2 + D1 and
  * returns { saved:[{id,brand,filename}], count }.
+ *
+ * After a successful save the knowledge digests are written FIRE-AND-FORGET:
+ * with an ExecutionContext (the Worker route passes one) they run in
+ * ctx.waitUntil after the response; without one they are awaited but NEVER
+ * reject (writeAnalysisDigests swallows every failure), so the save's result
+ * is identical either way.
  */
 export async function handleLibrarySave(
-  env: AccessConfig & { LIBRARY: D1Database; RESULT_BUCKET: R2Bucket },
+  env: AccessConfig & {
+    LIBRARY: D1Database;
+    RESULT_BUCKET: R2Bucket;
+    KNOWLEDGE_BUCKET?: R2Bucket;
+  },
   request: Request,
-  json: JsonResponder
+  json: JsonResponder,
+  ctx?: ExecutionContext
 ): Promise<Response> {
   const owner = await ownerOr401(env, request, json);
   if (owner instanceof Response) return owner;
@@ -427,6 +445,23 @@ export async function handleLibrarySave(
     explain,
     results,
   });
+
+  // Knowledge digest hook (advisory "Ask" corpus) — AFTER the successful save,
+  // best-effort by contract: the promise never rejects, a failed/skipped digest
+  // never affects the save. Fire-and-forget when the route handed us the
+  // ExecutionContext; otherwise await the (non-throwing) writes.
+  const digests = writeAnalysisDigests(env, {
+    owner,
+    fileSha256,
+    savedAt: Date.now(),
+    runs,
+    results,
+  });
+  if (ctx) {
+    ctx.waitUntil(digests);
+  } else {
+    await digests;
+  }
 
   return json(saved satisfies LibrarySaveResponse, 201);
 }

@@ -33,6 +33,33 @@ export interface Env {
   /** R2 bucket holding staged PDFs (pdfs/<jobId>/<i>.pdf) + results (results/<jobId>.json). */
   RESULT_BUCKET: R2Bucket;
 
+  // --- "Ask": advisory Q&A over the collected knowledge ------------------------
+
+  /**
+   * R2 bucket ("pa-knowledge") holding the markdown KNOWLEDGE DIGESTS the
+   * Worker writes alongside every library save and web-check verdict, at
+   * knowledge/<encodeURIComponent(owner)>/<sha>-<brand>[-webcheck].md. The
+   * dashboard-created AI Search instance indexes this bucket; the owner path
+   * segment is the tenancy boundary /api/ask filters on. Digest writes are
+   * best-effort (src/knowledge.ts writeDigest never throws).
+   */
+  KNOWLEDGE_BUCKET: R2Bucket;
+
+  /**
+   * Workers AI binding — used ONLY to reach AI Search for the advisory Ask
+   * feature, via the legacy-but-supported `env.AI.autorag(name).aiSearch()`
+   * call (the instance is referenced by string at call time; an absent or
+   * misnamed instance makes /api/ask answer 503, nothing else is affected).
+   */
+  AI: Ai;
+
+  /**
+   * Name of the AI Search instance /api/ask queries (default "pa-knowledge").
+   * Created by the OPERATOR in the dashboard (AI > AI Search) over the
+   * pa-knowledge bucket — until it exists, /api/ask degrades to a clean 503.
+   */
+  AISEARCH_NAME?: string;
+
   // --- Persistent library (D1 index; full results live in RESULT_BUCKET) ------
 
   /**

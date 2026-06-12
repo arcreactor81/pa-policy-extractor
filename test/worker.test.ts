@@ -1,9 +1,15 @@
 import { SELF, env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import type { BrandsResponse, ErrorResponse } from "../src/types";
+import type { BrandsResponse, ErrorResponse, ExtractResult } from "../src/types";
 import { ensureCohortSchema } from "../src/cohorts";
 import { pdfOutcomeAfterDone } from "../src/job-coordinator";
 import { buildFdaUrl, isSafeUrl, packAroundBrand } from "../src/web-check";
+import type { WebCheckDoc } from "../src/web-check";
+import {
+  buildAnalysisDigest,
+  buildWebCheckDigest,
+  digestKey,
+} from "../src/knowledge";
 
 /**
  * Worker-level tests. These exercise ONLY the paths the Worker resolves itself
@@ -581,6 +587,258 @@ describe("web-check helpers: isSafeUrl (SSRF guard)", () => {
     "not a url",
   ])("rejects %s", (u) => {
     expect(isSafeUrl(u)).toBe(false);
+  });
+});
+
+/**
+ * Ask (advisory Q&A over the knowledge corpus): POST /api/ask validation +
+ * graceful degradation. Every 400 asserted here returns BEFORE the AI binding
+ * is touched. The "valid question" case asserts the 503 DEGRADATION path: in
+ * the vitest pool the AI Search instance does not exist (it is created in the
+ * dashboard over the pa-knowledge bucket), so the binding call fails and the
+ * handler must answer the clean setup-hint 503 — never a throw. Each request
+ * carries a UNIQUE cf-connecting-ip (the wc tests' ipSeq pattern): without it
+ * every request shares the limiter's "unknown" bucket and this block would
+ * trip the 15/min window mid-suite.
+ */
+describe("POST /api/ask (validation + 503 degradation)", () => {
+  let ipSeq = 0;
+  function post(body: BodyInit | undefined, jsonBody?: unknown): Promise<Response> {
+    ipSeq += 1;
+    return SELF.fetch("https://example.com/api/ask", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "cf-connecting-ip": `198.51.102.${ipSeq}`,
+      },
+      body: jsonBody !== undefined ? JSON.stringify(jsonBody) : body,
+    });
+  }
+
+  it("rejects non-POST methods with 405", async () => {
+    const res = await SELF.fetch("https://example.com/api/ask", {
+      headers: { "cf-connecting-ip": "198.51.102.250" },
+    });
+    expect(res.status).toBe(405);
+    const body = (await res.json()) as ErrorResponse;
+    expect(body.error).toMatch(/use POST/i);
+  });
+
+  it("400s a non-JSON body", async () => {
+    const res = await post("not json");
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as ErrorResponse;
+    expect(body.error).toMatch(/JSON body/i);
+  });
+
+  it("400s a missing question", async () => {
+    const res = await post(undefined, {});
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as ErrorResponse;
+    expect(body.error).toMatch(/question/i);
+  });
+
+  it("400s an empty/whitespace question", async () => {
+    const res = await post(undefined, { question: "   " });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as ErrorResponse;
+    expect(body.error).toMatch(/question/i);
+  });
+
+  it("400s an oversized question (> 1000 chars)", async () => {
+    const res = await post(undefined, { question: "x".repeat(1001) });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as ErrorResponse;
+    expect(body.error).toMatch(/too long/i);
+  });
+
+  it("degrades to 503 with a setup hint when the AI Search instance is absent", async () => {
+    const res = await post(undefined, {
+      question: "Which payers restrict TREMFYA the most?",
+    });
+    expect(res.status).toBe(503);
+    const body = (await res.json()) as ErrorResponse;
+    expect(body.error).toMatch(/not configured/i);
+    expect(body.error).toMatch(/pa-knowledge/i);
+  });
+});
+
+/**
+ * Knowledge backfill: owner-scoped + idempotent. With a brand-new owner the
+ * library has no rows, so the endpoint must answer 200 {written:0, skipped:0}
+ * (and apply the lazy schema rather than erroring on a missing table).
+ */
+describe("POST /api/knowledge/backfill", () => {
+  const OWNER_HEADER = "cf-access-authenticated-user-email";
+  let ipSeq = 0;
+  function post(owner: string): Promise<Response> {
+    ipSeq += 1;
+    return SELF.fetch("https://example.com/api/knowledge/backfill", {
+      method: "POST",
+      headers: {
+        [OWNER_HEADER]: owner,
+        "cf-connecting-ip": `198.51.103.${ipSeq}`,
+      },
+    });
+  }
+
+  it("rejects non-POST methods with 405", async () => {
+    const res = await SELF.fetch("https://example.com/api/knowledge/backfill", {
+      headers: { "cf-connecting-ip": "198.51.103.250" },
+    });
+    expect(res.status).toBe(405);
+  });
+
+  it("answers 200 {written:0, skipped:0} on an empty library", async () => {
+    const owner = `kb-${crypto.randomUUID()}@example.com`;
+    const res = await post(owner);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { written?: number; skipped?: number };
+    expect(body.written).toBe(0);
+    expect(body.skipped).toBe(0);
+  });
+});
+
+describe("knowledge digest builders", () => {
+  const SHA = "ab".repeat(32);
+
+  /** A representative saved analysis doc (spans + confidence + consensus). */
+  function sampleResult(): ExtractResult {
+    return {
+      result: {
+        Filename: "policy.pdf",
+        Brand: "TREMFYA",
+        Age: "18 years or older",
+        "Step Therapy Requirements Documented in Policy": "Yes",
+        "Number of Steps through Brands": "2",
+        "Number of Steps through Generic": "1",
+        "Step through-Phototherapy": "No",
+        "TB Test required": "Yes",
+        "Quantity Limits": "Yes",
+        "Specialist Types": "Dermatologist",
+        "Initial Authorization Duration(in-months)": "12",
+        "Reauthorization Duration(in-months)": "12",
+        "Reauthorization Required": "Yes",
+        "Reauthorization Requirements Documented in Policy": "Yes",
+        "Access Score": 75,
+      },
+      access_justification:
+        "The policy is broader than the FDA label for TREMFYA.",
+      meta: {
+        source: "reduced",
+        full_markdown_chars: 1000,
+        reduced_chars: 500,
+        reduction_pct: 50,
+        timings_ms: { docling_ms: 1, reduce_ms: 1, extract_ms: 1, score_ms: 1 },
+        model: "deepseek-v4-pro",
+        runs: 3,
+      },
+      policy_text: "irrelevant for the digest",
+      confidence: {
+        Age: { value: "18 years or older", agreement: 2 / 3, distinct: ["18 years or older", "18+"] },
+      },
+      spans: {
+        Age: { found: true, quotes: ["Members must be 18 years of age or older."] },
+      },
+      consensus: {
+        Age: { primary: "18 years or older", secondary: "18 years or older", agree: true },
+      },
+    };
+  }
+
+  it("buildAnalysisDigest carries brand/filename/sha/score bucket/evidence", () => {
+    const md = buildAnalysisDigest({
+      sha: SHA,
+      brand: "TREMFYA",
+      filename: "policy.pdf",
+      savedAt: 1750000000000,
+      runs: 3,
+      result: sampleResult(),
+    });
+    expect(md).toContain("# TREMFYA — policy.pdf");
+    expect(md).toContain(SHA);
+    expect(md).toContain("**75 — Preferred.**");
+    expect(md).toContain("broader than the FDA label");
+    // Evidence quote (verbatim from spans) + agreement + consensus notes.
+    expect(md).toContain("Members must be 18 years of age or older.");
+    expect(md).toMatch(/Run agreement: 67%/);
+    expect(md).toMatch(/primary and secondary models agree/);
+    // Every extracted parameter section is present.
+    expect(md).toContain("### Quantity Limits");
+    expect(md).toContain("- Value: Dermatologist");
+  });
+
+  it("buildAnalysisDigest truncates long quotes and caps the digest size", () => {
+    const result = sampleResult();
+    result.spans = {
+      Age: { found: true, quotes: ["q".repeat(5000), "r".repeat(5000)] },
+    };
+    result.access_justification = "j".repeat(10_000);
+    const md = buildAnalysisDigest({
+      sha: SHA,
+      brand: "TREMFYA",
+      filename: "policy.pdf",
+      savedAt: Date.now(),
+      runs: 1,
+      result,
+    });
+    // Each quote is clipped (600 chars + marker), never embedded whole.
+    expect(md).not.toContain("q".repeat(601));
+    expect(md).toContain("q".repeat(600) + " […]");
+    expect(md.length).toBeLessThanOrEqual(100_100);
+  });
+
+  it("buildWebCheckDigest carries the advisory line, verdicts and FDA findings", () => {
+    const doc: WebCheckDoc = {
+      checked_at: 1750000000000,
+      sha: SHA,
+      brand: "TREMFYA",
+      owner: "user@example.com",
+      url: "https://payer.example.com/policy",
+      payer: { markdown: "..." },
+      fda: { found: true, matched_field: "brand_name" },
+      verdicts: {
+        params: {
+          Age: {
+            web_value: "18 years or older",
+            status: "confirmed",
+            quote: "Patients must be at least 18 years old.",
+          },
+        },
+        fda_label: {
+          found: true,
+          age_consistent: "yes",
+          indication_quote: "TREMFYA is indicated for adults.",
+          notes: "Label agrees with the policy age limit.",
+        },
+        policy_notes: "The page shows a 2026 policy revision.",
+      },
+      version: 1,
+    };
+    const md = buildWebCheckDigest(doc);
+    expect(md).toContain("# TREMFYA — live web check (advisory)");
+    expect(md).toMatch(/ADVISORY ONLY/);
+    expect(md).toContain(SHA);
+    expect(md).toContain("https://payer.example.com/policy");
+    expect(md).toContain("### Age — confirmed");
+    expect(md).toContain("Patients must be at least 18 years old.");
+    expect(md).toContain("- Age consistency vs label: yes");
+    expect(md).toContain("TREMFYA is indicated for adults.");
+    expect(md).toContain("The page shows a 2026 policy revision.");
+    expect(md).toContain(new Date(1750000000000).toISOString());
+  });
+
+  it("digestKey shapes the tenancy path and percent-encodes the owner", () => {
+    expect(digestKey("user@example.com", SHA, "TREMFYA", "analysis")).toBe(
+      `knowledge/user%40example.com/${SHA}-TREMFYA.md`
+    );
+    expect(digestKey("user@example.com", SHA, "TREMFYA", "webcheck")).toBe(
+      `knowledge/user%40example.com/${SHA}-TREMFYA-webcheck.md`
+    );
+    // The owner segment can never escape its folder (no raw "/" survives).
+    expect(digestKey("a/b@example.com", SHA, "TREMFYA", "analysis")).toBe(
+      `knowledge/a%2Fb%40example.com/${SHA}-TREMFYA.md`
+    );
   });
 });
 

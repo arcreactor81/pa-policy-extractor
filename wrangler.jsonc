@@ -52,9 +52,30 @@
   // here; the retention alarm deletes per-job objects after RETENTION_DAYS.
   // ALSO holds the persistent-library full result JSON (results/lib/<id>.json),
   // whose lean index lives in the LIBRARY D1 database below.
+  //
+  // KNOWLEDGE_BUCKET ("pa-knowledge", already provisioned) backs the ADVISORY
+  // "Ask" feature: every saved analysis and every web-check verdict ALSO writes
+  // a markdown digest to knowledge/<owner>/<sha>-<brand>[-webcheck].md (the
+  // owner path segment is the tenancy boundary AI Search folder filters scope
+  // on). Digest writes are best-effort by contract — a failure never breaks
+  // the analysis/library/webcheck flows.
   "r2_buckets": [
-    { "binding": "RESULT_BUCKET", "bucket_name": "pa-job-results" }
+    { "binding": "RESULT_BUCKET", "bucket_name": "pa-job-results" },
+    { "binding": "KNOWLEDGE_BUCKET", "bucket_name": "pa-knowledge" }
   ],
+
+  // Workers AI binding — used ONLY by the advisory "Ask" feature (POST
+  // /api/ask) to reach AI Search via env.AI.autorag(AISEARCH_NAME).aiSearch().
+  // The AI Search instance itself is created in the DASHBOARD (AI > AI Search)
+  // over the pa-knowledge bucket and referenced BY NAME at call time, so
+  // nothing here points at it: an absent/misnamed instance degrades /api/ask
+  // to a clean 503 and never breaks the analysis flows. NOTE: do NOT set
+  // `remote` here — wrangler hard-errors on `remote: false` (AI has no local
+  // simulator) and `remote: true` would make the vitest pool demand an
+  // authenticated remote proxy session; left unset, local dev/tests get a
+  // stub whose calls fail (the asserted 503 path) with only a wrangler
+  // warning, and production always binds the real service.
+  "ai": { "binding": "AI" },
 
   // D1 database backing the persistent, queryable analysis library (table
   // `analyses`). The schema is applied LAZILY at runtime via CREATE TABLE IF NOT
@@ -177,7 +198,16 @@
     // #3 (cost): persistent-library retention. The daily scheduled() cron prunes
     // `analyses` rows (and their R2 results/lib/<id>.json) older than this many
     // days, bounded per run, so the library cannot grow unbounded. Default 30.
-    "LIBRARY_RETENTION_DAYS": "30"
+    "LIBRARY_RETENTION_DAYS": "30",
+
+    // "Ask" (advisory Q&A over the collected knowledge): the NAME of the AI
+    // Search instance POST /api/ask queries. OPERATOR SETUP: create it in the
+    // dashboard (AI > AI Search) with this exact name, pointed at the
+    // pa-knowledge R2 bucket (KNOWLEDGE_BUCKET above); it then continuously
+    // indexes the digests the Worker writes. Until it exists (or if the name
+    // here doesn't match), /api/ask answers a clean 503 — the digest writes and
+    // every analysis/library/webcheck flow keep working unchanged.
+    "AISEARCH_NAME": "pa-knowledge"
 
     // Opt-in tenant isolation (security fix #2) — UNSET by default. To verify
     // identity via signed Cloudflare Access JWTs instead of trusting the

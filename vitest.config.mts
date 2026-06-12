@@ -23,6 +23,16 @@ export default defineConfig({
   plugins: [
     cloudflareTest({
       wrangler: { configPath: "./wrangler.jsonc" },
+      // The "Ask" feature adds an `ai` binding (wrangler.jsonc), and wrangler
+      // hard-classifies `ai`/`ai_search` bindings as remote-only (no local
+      // simulator — BINDING_LOCAL_SUPPORT in wrangler). With the pool's
+      // default remoteBindings:true that forces an AUTHENTICATED remote proxy
+      // session at startup, breaking `npm test` on any machine/CI without
+      // Cloudflare credentials. false keeps the suite hermetic: miniflare
+      // still provides env.AI, and every call on it throws a "remote
+      // required" error — which IS the /api/ask 503 degradation path the
+      // tests assert. Deployed behaviour is unaffected.
+      remoteBindings: false,
     }),
   ],
   test: {

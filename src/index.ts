@@ -51,6 +51,7 @@ import {
   handleWebCheckGet,
   handleWebCheckStatus,
 } from "./web-check";
+import { handleAsk, handleKnowledgeBackfill } from "./knowledge";
 import { clampRuns, parseBrandsCsv, parseExplain } from "./util";
 
 // Re-export the RateLimiter DO so wrangler can bind the class from src/index.ts
@@ -239,7 +240,7 @@ export class PaContainer extends Container<Env> {
  */
 const SECURITY_HEADERS: Readonly<Record<string, string>> = {
   "content-security-policy":
-    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
+    "default-src 'self'; font-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
     "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; " +
     "base-uri 'self'; object-src 'none'; form-action 'self'",
   "x-content-type-options": "nosniff",
@@ -659,7 +660,11 @@ async function handleCohortRoutes(
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(
+    request: Request,
+    env: Env,
+    ctx: ExecutionContext
+  ): Promise<Response> {
     const url = new URL(request.url);
     const { pathname } = url;
 
@@ -912,7 +917,9 @@ export default {
         const limited = await enforceRateLimit(env, request);
         if (limited) return limited;
         try {
-          return await handleLibrarySave(env, request, json);
+          // ctx lets the save fire its knowledge digests via waitUntil (after
+          // the response); the save result is identical without it.
+          return await handleLibrarySave(env, request, json, ctx);
         } catch (err) {
           return json(
             {
@@ -1096,6 +1103,80 @@ export default {
         { error: "method not allowed; use GET or POST" } satisfies ErrorResponse,
         405
       );
+    }
+
+    // --- Ask: advisory Q&A over the caller's knowledge corpus ---------------
+    // POST /api/ask                 — question -> AI Search (retrieval +
+    //                                 generation + citations), scoped to the
+    //                                 caller's own knowledge/<owner>/ digests.
+    // POST /api/knowledge/backfill  — (re)write digests for the caller's
+    //                                 existing library rows (idempotent).
+    // Both are ADVISORY only and rate-limited + owner-resolved HERE (the
+    // handlers in src/knowledge.ts receive the resolved owner — same split as
+    // the webcheck routes). When the dashboard-created AI Search instance is
+    // absent/misnamed, /api/ask degrades to a clean 503 and NOTHING else is
+    // affected — digest writes and Ask errors never touch analysis flows.
+    if (pathname === "/api/ask") {
+      if (request.method !== "POST") {
+        return json(
+          { error: "method not allowed; use POST" } satisfies ErrorResponse,
+          405
+        );
+      }
+      // Rate limit (per client IP) BEFORE the AI Search call (it spends a
+      // retrieval + generation round-trip).
+      const limited = await enforceRateLimit(env, request);
+      if (limited) return limited;
+      const ownerRes = await resolveOwner(env, request);
+      if ("unauthorized" in ownerRes) {
+        return json(
+          { error: `unauthorized: ${ownerRes.reason}` } satisfies ErrorResponse,
+          401
+        );
+      }
+      try {
+        return await handleAsk(env, request, ownerRes.owner, json);
+      } catch (err) {
+        return json(
+          {
+            error:
+              "ask failed: " +
+              (err instanceof Error ? err.message : String(err)),
+          } satisfies ErrorResponse,
+          500
+        );
+      }
+    }
+
+    if (pathname === "/api/knowledge/backfill") {
+      if (request.method !== "POST") {
+        return json(
+          { error: "method not allowed; use POST" } satisfies ErrorResponse,
+          405
+        );
+      }
+      // Rate limit: a backfill fans out up to 200 R2 reads + writes.
+      const limited = await enforceRateLimit(env, request);
+      if (limited) return limited;
+      const ownerRes = await resolveOwner(env, request);
+      if ("unauthorized" in ownerRes) {
+        return json(
+          { error: `unauthorized: ${ownerRes.reason}` } satisfies ErrorResponse,
+          401
+        );
+      }
+      try {
+        return await handleKnowledgeBackfill(env, ownerRes.owner, json);
+      } catch (err) {
+        return json(
+          {
+            error:
+              "knowledge backfill failed: " +
+              (err instanceof Error ? err.message : String(err)),
+          } satisfies ErrorResponse,
+          500
+        );
+      }
     }
 
     // --- Unknown /api/* path -----------------------------------------------
