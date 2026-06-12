@@ -1252,6 +1252,9 @@
     // clones cards into its own sections and never sets this).
     card.setAttribute("data-brand-card", evt.brand);
     populateBrandCard(card, evt, selectedFile ? selectedFile.name : "");
+    // P0 Live Web Check — single-analysis flow ONLY (batch/library renderings
+    // never come through here). Advisory: it can never alter the score above.
+    attachWebCheck(card, evt.brand, evt.result || {});
   }
 
   // Populate an EXISTING (template-cloned) brand-result card from a `result`
@@ -2170,6 +2173,390 @@
     document.body.appendChild(ta); ta.select();
     try { document.execCommand("copy"); done(); } catch (e) { status.textContent = "Copy failed"; }
     document.body.removeChild(ta);
+  }
+
+  // =========================================================================
+  // P0: LIVE WEB CHECK (advisory) — cross-check a card's extraction against
+  // the payer's live page + the FDA label. SINGLE-analysis flow only: batch
+  // and library renderings never call attachWebCheck. Strictly advisory — it
+  // never alters the access score or any extracted value.
+  //
+  // Backend contract (Worker, built in parallel):
+  //   POST /api/webcheck                 {sha, brand, url?, params} -> {id}
+  //   GET  /api/webcheck/status?id=...   -> {status:{..., status:"queued|running|complete|errored|terminated"}}
+  //   GET  /api/webcheck?sha=..&brand=.. -> persisted verdict doc (404 = none)
+  // "sha" is the SAME sha256-hex-of-the-PDF-bytes already computed for sticky
+  // routing (computeRouteHex / selectedFileRoute) — one fingerprint everywhere.
+  // =========================================================================
+  var WC_POLL_MS = 5000;        // status poll cadence
+  var WC_POLL_CAP_MS = 180000;  // ~3 min; then a timeout note + manual refresh
+  var wcSeq = 0;                // unique ids for the aria-controls wiring
+
+  // Per-param verdict badge: status -> pastel chip class + glyph'd text (text
+  // always carried — never color-only). Unknown statuses degrade to a neutral
+  // chip showing the raw status word.
+  var WC_STATUS_META = {
+    "confirmed":   { cls: "wc-badge-ok",   text: "✓ confirmed" },
+    "discrepancy": { cls: "wc-badge-bad",  text: "⚠ differs" },
+    "updated":     { cls: "wc-badge-warn", text: "↻ updated" },
+    "not_found":   { cls: "wc-badge-na",   text: "— not found" }
+  };
+
+  // "checked 4 min ago" for the verdict footer. Accepts epoch ms or a parseable
+  // date string; unparseable input falls back to the raw string (never throws).
+  function wcRelTime(ts) {
+    var ms = null;
+    if (typeof ts === "number" && isFinite(ts)) ms = ts;
+    else if (ts) {
+      var p = Date.parse(String(ts));
+      if (!isNaN(p)) ms = p;
+    }
+    if (ms == null) return ts ? String(ts) : "just now";
+    var d = Date.now() - ms;
+    if (d < 0) d = 0;
+    if (d < 45000) return "just now";
+    var min = Math.round(d / 60000);
+    if (min < 60) return min + " min ago";
+    var h = Math.round(min / 60);
+    if (h < 24) return h + " h ago";
+    var days = Math.round(h / 24);
+    return days + " day" + (days === 1 ? "" : "s") + " ago";
+  }
+
+  function wcBadge(cls, text) { return el("span", "wc-badge " + cls, text); }
+
+  // Single-line, CSS-truncated mono quote; the FULL quote lives in title.
+  function wcQuote(q) {
+    var s = String(q);
+    var node = el("div", "wc-quote", s);
+    node.title = s;
+    return node;
+  }
+
+  // FDA-label verdict row: ✓ consistent / ⚠ check age / — label not found.
+  function wcFdaRow(fda) {
+    var row = el("div", "wc-row wc-row-fda");
+    var head = el("div", "wc-row-head");
+    head.appendChild(el("span", "wc-param", "FDA label"));
+    var found = !!(fda && fda.found);
+    if (!found) head.appendChild(wcBadge("wc-badge-na", "— label not found"));
+    else if (fda.age_consistent) head.appendChild(wcBadge("wc-badge-ok", "✓ consistent"));
+    else head.appendChild(wcBadge("wc-badge-warn", "⚠ check age"));
+    row.appendChild(head);
+    if (found && fda.indication_quote) row.appendChild(wcQuote(fda.indication_quote));
+    if (found && fda.notes) row.appendChild(el("p", "wc-row-notes", String(fda.notes)));
+    return row;
+  }
+
+  // One per-param verdict row: mono-caps param name, status chip, web value,
+  // truncated source quote (full value/quote always in title).
+  function wcParamRow(col, v) {
+    var row = el("div", "wc-row");
+    var head = el("div", "wc-row-head");
+    head.appendChild(el("span", "wc-param", fieldLabel(col)));
+    var meta = (v && WC_STATUS_META[v.status]) ||
+      { cls: "wc-badge-na", text: "— " + (v && v.status ? String(v.status) : "unknown") };
+    head.appendChild(wcBadge(meta.cls, meta.text));
+    if (v && v.web_value != null && String(v.web_value).trim() !== "") {
+      var wv = el("span", "wc-web-value", "web: " + String(v.web_value));
+      wv.title = String(v.web_value);
+      head.appendChild(wv);
+    }
+    row.appendChild(head);
+    if (v && v.quote) row.appendChild(wcQuote(v.quote));
+    return row;
+  }
+
+  // Expand/collapse: opening un-hides the body and replays a transform/opacity
+  // entrance (CSS animation, reduced-motion guarded in CSS); closing snaps.
+  function wcSetOpen(section, body, btn, open) {
+    btn.setAttribute("aria-expanded", open ? "true" : "false");
+    section.classList.toggle("is-open", open);
+    if (open) {
+      body.hidden = false;
+      if (!reducedMotion()) {
+        body.classList.remove("wc-body-in");
+        void body.offsetWidth; // restart the entrance animation cleanly
+        body.classList.add("wc-body-in");
+      }
+    } else {
+      body.hidden = true;
+      body.classList.remove("wc-body-in");
+    }
+  }
+
+  // Build + wire the collapsible "Live web check" section at the BOTTOM of a
+  // brand result card. Idempotent: a re-render replaces the previous section.
+  function attachWebCheck(cardEl, brand, res) {
+    var prev = cardEl.querySelector(".wc-section");
+    if (prev && prev.parentNode) prev.parentNode.removeChild(prev);
+
+    // The webcheck key is the SAME sha256-of-file-bytes used for sticky routing.
+    var shaPromise = selectedFileRoute ||
+      (selectedFile ? computeRouteHex(selectedFile) : Promise.resolve(null));
+
+    // Snapshot of this card's 13 deliverable values (the POST "params" body).
+    var params = {};
+    for (var k in FIELD_LABELS) {
+      if (FIELD_LABELS.hasOwnProperty(k) && res.hasOwnProperty(k)) params[k] = res[k];
+    }
+
+    var section = el("section", "wc-section");
+    section.setAttribute("aria-label", "Live web check (advisory)");
+
+    // ---- collapsed header row ----------------------------------------------
+    var toggle = el("button", "wc-toggle");
+    toggle.type = "button";
+    toggle.appendChild(el("span", "wc-toggle-label", "LIVE WEB CHECK"));
+    toggle.appendChild(el("span", "wc-advisory-chip", "advisory"));
+    var chev = el("span", "wc-chevron");
+    chev.setAttribute("aria-hidden", "true");
+    toggle.appendChild(chev);
+    section.appendChild(toggle);
+
+    // ---- expandable body -----------------------------------------------------
+    var body = el("div", "wc-body");
+    body.hidden = true;
+    body.id = "wc-body-" + (++wcSeq);
+    toggle.setAttribute("aria-controls", body.id);
+    toggle.setAttribute("aria-expanded", "false");
+    toggle.addEventListener("click", function () {
+      wcSetOpen(section, body, toggle, body.hidden);
+    });
+
+    var explainer = el("p", "wc-explainer",
+      "Cross-checks this extraction against the payer's live page and the FDA label. Advisory — never changes the score.");
+
+    var form = el("div", "wc-form");
+    var urlInput = document.createElement("input");
+    urlInput.type = "url";
+    urlInput.className = "wc-url";
+    urlInput.placeholder = "Payer policy URL (optional — FDA label check runs without it)";
+    urlInput.setAttribute("aria-label", "Payer policy URL (optional)");
+    var runBtn = el("button", "btn btn-ghost btn-sm wc-run-btn");
+    runBtn.type = "button";
+    runBtn.appendChild(el("span", "btn-spinner"));
+    var runLabel = el("span", "wc-run-label", "Run check");
+    runBtn.appendChild(runLabel);
+    form.appendChild(urlInput);
+    form.appendChild(runBtn);
+
+    var note = el("div", "wc-note");
+    note.hidden = true;
+    note.setAttribute("role", "status"); // polite live region for state changes
+
+    var verdict = el("div", "wc-verdict");
+    verdict.hidden = true;
+
+    body.appendChild(explainer);
+    body.appendChild(form);
+    body.appendChild(note);
+    body.appendChild(verdict);
+    section.appendChild(body);
+    cardEl.appendChild(section);
+
+    // ---- section-local helpers -----------------------------------------------
+    // A fresh run clears #cards-host; any in-flight poll then quietly stops.
+    function alive() { return document.documentElement.contains(section); }
+
+    function setBusy(b) {
+      runBtn.disabled = b;
+      urlInput.disabled = b;
+      runBtn.classList.toggle("is-loading", b);
+      runLabel.textContent = b ? "Checking…" : "Run check";
+    }
+
+    function clearNote() { note.hidden = true; clearChildren(note); }
+
+    function showNote(kind, msg, withRefresh) {
+      clearChildren(note);
+      note.className = "wc-note wc-note-" + kind;
+      note.appendChild(el("span", "wc-note-text", msg));
+      if (withRefresh) {
+        var rb = el("button", "btn btn-ghost btn-sm wc-refresh-btn", "Refresh");
+        rb.type = "button";
+        rb.addEventListener("click", function () { fetchDoc(true); });
+        note.appendChild(rb);
+      }
+      note.hidden = false;
+    }
+
+    function showForm(prefillUrl) {
+      if (prefillUrl && !urlInput.value) urlInput.value = prefillUrl;
+      hide(verdict);
+      show(explainer);
+      show(form);
+    }
+
+    // ---- verdict rendering -----------------------------------------------------
+    function renderVerdict(doc) {
+      clearChildren(verdict);
+      var verdicts = (doc && doc.verdicts) || {};
+      // (a) FDA label first. Tolerates a doc that only carries verdicts.fda_label.
+      verdict.appendChild(wcFdaRow((doc && doc.fda) || verdicts.fda_label || null));
+      // (e) payer fetch error (e.g. missing token scope): amber, non-fatal.
+      if (doc && doc.payer && doc.payer.error) {
+        verdict.appendChild(el("p", "wc-payer-error",
+          "Payer page check unavailable: " + String(doc.payer.error)));
+      }
+      // (b) per-param rows — ONLY params the verdict actually contains, in the
+      // deliverable-column display order (unknown extras append after, raw-named).
+      var p = verdicts.params || {};
+      var ordered = [];
+      var col;
+      for (col in FIELD_LABELS) {
+        if (FIELD_LABELS.hasOwnProperty(col) && p.hasOwnProperty(col)) ordered.push(col);
+      }
+      for (col in p) {
+        if (p.hasOwnProperty(col) && ordered.indexOf(col) === -1) ordered.push(col);
+      }
+      ordered.forEach(function (c) { verdict.appendChild(wcParamRow(c, p[c])); });
+      // (c) free-text policy notes.
+      var pn = verdicts.policy_notes;
+      if (pn && String(pn).trim()) verdict.appendChild(el("p", "wc-policy-notes", String(pn)));
+      // (d) footer: source link + relative check time + re-run affordance.
+      var foot = el("div", "wc-foot");
+      if (doc && doc.url) {
+        var a = el("a", "wc-source-link", "View source");
+        a.href = doc.url;
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+        foot.appendChild(a);
+      }
+      foot.appendChild(el("span", "wc-checked-at", "checked " + wcRelTime(doc && doc.checked_at)));
+      var rerun = el("button", "btn btn-ghost btn-sm wc-rerun-btn", "Re-run");
+      rerun.type = "button";
+      rerun.addEventListener("click", function () {
+        clearNote();
+        showForm(doc && doc.url);
+        try { urlInput.focus(); } catch (e) { /* ignore */ }
+      });
+      foot.appendChild(rerun);
+      verdict.appendChild(foot);
+
+      hide(explainer);
+      hide(form);
+      show(verdict);
+    }
+
+    // ---- GET the persisted verdict doc ----------------------------------------
+    // manual=false is the lazy on-render preload: fire-and-forget, 404/network
+    // failures stay silent. manual=true surfaces problems in the note strip.
+    function fetchDoc(manual) {
+      shaPromise.then(function (sha) {
+        if (!sha || !alive()) return;
+        fetch("/api/webcheck?sha=" + encodeURIComponent(sha) +
+              "&brand=" + encodeURIComponent(brand),
+              { headers: { "Accept": "application/json" } })
+          .then(function (r) {
+            if (r.status === 404) {
+              if (manual) {
+                setBusy(false);
+                showNote("amber", "No saved verdict for this document + brand yet.", true);
+              }
+              return null;
+            }
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            return r.json();
+          })
+          .then(function (doc) {
+            if (!doc || !alive()) return;
+            setBusy(false);
+            clearNote();
+            renderVerdict(doc);
+          })
+          .catch(function (err) {
+            if (!alive() || !manual) return;
+            setBusy(false);
+            showNote("red", "Could not load the verdict — " +
+              (err && err.message ? err.message : "network error") + ".", true);
+          });
+      });
+    }
+
+    // ---- status polling --------------------------------------------------------
+    function poll(id, t0) {
+      if (!alive()) return;
+      if (Date.now() - t0 > WC_POLL_CAP_MS) {
+        setBusy(false);
+        showNote("amber",
+          "Still running after 3 minutes — the verdict is saved when it finishes.", true);
+        return;
+      }
+      fetch("/api/webcheck/status?id=" + encodeURIComponent(id),
+            { headers: { "Accept": "application/json" } })
+        .then(function (r) {
+          if (!r.ok) throw new Error("HTTP " + r.status);
+          return r.json();
+        })
+        .then(function (j) {
+          if (!alive()) return;
+          var st = (j && j.status && j.status.status) ? String(j.status.status) : "";
+          if (st === "complete") {
+            fetchDoc(true);
+          } else if (st === "errored" || st === "terminated") {
+            setBusy(false);
+            showNote("red", "The web check " +
+              (st === "errored" ? "failed" : "was terminated") + " — you can try again.", false);
+          } else {
+            // queued / running / unknown: keep polling until the cap.
+            setTimeout(function () { poll(id, t0); }, WC_POLL_MS);
+          }
+        })
+        .catch(function () {
+          // Transient status hiccup: keep polling; the time cap still bounds us.
+          if (alive()) setTimeout(function () { poll(id, t0); }, WC_POLL_MS);
+        });
+    }
+
+    // ---- run ---------------------------------------------------------------------
+    runBtn.addEventListener("click", function () {
+      if (runBtn.disabled) return;
+      clearNote();
+      setBusy(true);
+      shaPromise.then(function (sha) {
+        if (!alive()) return;
+        if (!sha) {
+          setBusy(false);
+          showNote("red",
+            "Could not fingerprint this PDF (a secure context is required), so the check cannot be keyed.", false);
+          return;
+        }
+        var payload = { sha: sha, brand: brand, params: params };
+        var u = (urlInput.value || "").trim();
+        if (u) payload.url = u;
+        fetch("/api/webcheck", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Accept": "application/json" },
+          body: JSON.stringify(payload)
+        })
+          .then(function (r) {
+            if (!r.ok) {
+              return r.text().then(function (t) {
+                var d = null;
+                try { d = t ? JSON.parse(t) : null; } catch (e2) { d = null; }
+                throw new Error((d && d.error) || ("HTTP " + r.status));
+              });
+            }
+            return r.json();
+          })
+          .then(function (j) {
+            if (!alive()) return;
+            if (!j || !j.id) throw new Error("the server did not return a check id");
+            poll(String(j.id), Date.now());
+          })
+          .catch(function (err) {
+            if (!alive()) return;
+            setBusy(false);
+            showNote("red", "Could not start the web check — " +
+              (err && err.message ? err.message : "network error") + ".", false);
+          });
+      });
+    });
+
+    // ---- lazy preload: a persisted check may already exist for (sha, brand).
+    // Fire-and-forget; 404 (or any failure) is silence by design.
+    fetchDoc(false);
   }
 
   // =========================================================================

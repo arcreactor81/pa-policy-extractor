@@ -46,6 +46,11 @@ import {
   handleCohortRuns,
   runCohort,
 } from "./cohorts";
+import {
+  handleWebCheckCreate,
+  handleWebCheckGet,
+  handleWebCheckStatus,
+} from "./web-check";
 import { clampRuns, parseBrandsCsv, parseExplain } from "./util";
 
 // Re-export the RateLimiter DO so wrangler can bind the class from src/index.ts
@@ -55,6 +60,11 @@ export { RateLimiter } from "./rate-limiter";
 // Re-export the JobCoordinator DO (Layer 3: async/batch jobs) so wrangler can
 // bind the class from this `main` entrypoint. Implementation in ./job-coordinator.
 export { JobCoordinator } from "./job-coordinator";
+
+// Re-export the WebCheckWorkflow (P0: advisory live web check) so wrangler can
+// bind the Workflow class from this `main` entrypoint. Implementation in
+// ./web-check.
+export { WebCheckWorkflow } from "./web-check";
 
 /**
  * The 15 in-scope brands (exact, uppercase). Kept in the Worker so /api/brands
@@ -989,6 +999,103 @@ export default {
           500
         );
       }
+    }
+
+    // --- P0: live web check /api/webcheck[...] ------------------------------
+    // POST /api/webcheck          — start an ADVISORY web-check Workflow (one
+    //                               brand's extracted params vs live sources).
+    // GET  /api/webcheck/status   — poll the Workflow instance status by id.
+    // GET  /api/webcheck          — the persisted verdict JSON from R2 (404
+    //                               until the workflow's persist step ran).
+    // Advisory only — nothing here ever touches analysis results. The status
+    // poll is keyed by the unguessable instance id (same posture as the jobId
+    // poll); the verdict GET is owner-checked against the stored doc.
+    if (pathname === "/api/webcheck/status") {
+      if (request.method !== "GET" && request.method !== "HEAD") {
+        return json(
+          { error: "method not allowed; use GET" } satisfies ErrorResponse,
+          405
+        );
+      }
+      try {
+        return await handleWebCheckStatus(env, url, json);
+      } catch (err) {
+        return json(
+          {
+            error:
+              "web check status failed: " +
+              (err instanceof Error ? err.message : String(err)),
+          } satisfies ErrorResponse,
+          500
+        );
+      }
+    }
+
+    if (pathname === "/api/webcheck") {
+      if (request.method === "POST") {
+        // Rate limit (per client IP) BEFORE creating a Workflow instance — a
+        // check spends Browser Rendering fetches plus a DeepSeek call.
+        const limited = await enforceRateLimit(env, request);
+        if (limited) return limited;
+        // Resolve the tenant identity BEFORE starting any work (the verdict
+        // doc is scoped to it). 401 only in opt-in Access-JWT mode.
+        const ownerRes = await resolveOwner(env, request);
+        if ("unauthorized" in ownerRes) {
+          return json(
+            { error: `unauthorized: ${ownerRes.reason}` } satisfies ErrorResponse,
+            401
+          );
+        }
+        try {
+          return await handleWebCheckCreate(
+            env,
+            request,
+            ownerRes.owner,
+            BRAND_SET,
+            json
+          );
+        } catch (err) {
+          return json(
+            {
+              error:
+                "web check submission failed: " +
+                (err instanceof Error ? err.message : String(err)),
+            } satisfies ErrorResponse,
+            500
+          );
+        }
+      }
+      if (request.method === "GET" || request.method === "HEAD") {
+        const ownerRes = await resolveOwner(env, request);
+        if ("unauthorized" in ownerRes) {
+          return json(
+            { error: `unauthorized: ${ownerRes.reason}` } satisfies ErrorResponse,
+            401
+          );
+        }
+        try {
+          return await handleWebCheckGet(
+            env,
+            ownerRes.owner,
+            url,
+            json,
+            applySecurityHeaders
+          );
+        } catch (err) {
+          return json(
+            {
+              error:
+                "web check read failed: " +
+                (err instanceof Error ? err.message : String(err)),
+            } satisfies ErrorResponse,
+            500
+          );
+        }
+      }
+      return json(
+        { error: "method not allowed; use GET or POST" } satisfies ErrorResponse,
+        405
+      );
     }
 
     // --- Unknown /api/* path -----------------------------------------------

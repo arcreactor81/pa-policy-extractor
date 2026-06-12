@@ -43,6 +43,20 @@ export interface Env {
    */
   LIBRARY: D1Database;
 
+  // --- P0: live web check (advisory live-source cross-check) -------------------
+
+  /**
+   * Workflow binding driving the ADVISORY "Live Web Check" (class
+   * WebCheckWorkflow in src/web-check.ts, re-exported from src/index.ts):
+   * payer policy page (Browser Rendering REST via CF_API_TOKEN, which needs
+   * the "Browser Rendering: Edit" scope — else that half degrades gracefully)
+   * + FDA label (openFDA) → one DeepSeek compare call → verdict persisted to
+   * RESULT_BUCKET at webchecks/<sha>/<brand>.json. Every network-bound step
+   * gets durable retries. Typed with the params payload so
+   * `create({ params })` is checked end-to-end.
+   */
+  WEB_CHECK_WF: Workflow<import("./src/web-check").WebCheckParams>;
+
   /** Max PDFs accepted per job (string from wrangler vars; default "25"). */
   MAX_PDFS_PER_JOB: string;
 
@@ -151,6 +165,11 @@ export interface Env {
    * (cross-check) extractor's OpenAI-compatible chat-completions calls. Set via
    * the Cloudflare dashboard (NOT in wrangler vars). When absent, the consensus
    * cross-check silently no-ops — the canonical DeepSeek result still returns.
+   *
+   * ALSO reused by the WebCheckWorkflow to call the Browser Rendering REST API
+   * (/markdown) for the live web check's payer-page fetch — add the
+   * "Browser Rendering: Edit" scope to the same token for that; without it
+   * (HTTP 403) payer-page fetches degrade gracefully (FDA-label-only check).
    */
   CF_API_TOKEN?: string;
 

@@ -75,6 +75,21 @@
     }
   ],
 
+  // P0 "Live Web Check" — a Cloudflare Workflow (class re-exported from
+  // src/index.ts, implementation in src/web-check.ts) running the ADVISORY
+  // live-source cross-check: fetch the payer's policy page + the brand's FDA
+  // label, ONE DeepSeek compare call, persist the verdict to R2
+  // (webchecks/<sha>/<brand>.json). The Workflow gives each network-bound step
+  // DURABLE retries (exponential backoff; progress survives restarts). The
+  // payer page is fetched via the Browser Rendering REST API authenticated
+  // with the CF_API_TOKEN secret — that token must ALSO carry the
+  // "Browser Rendering: Edit" scope, else payer-page fetches degrade
+  // gracefully (the FDA-label half of the check still runs). Advisory only:
+  // a web check never touches analysis results.
+  "workflows": [
+    { "name": "web-check", "binding": "WEB_CHECK_WF", "class_name": "WebCheckWorkflow" }
+  ],
+
   // Static UI in ./public. run_worker_first=true sends EVERY request through the
   // Worker first, so the Worker can wrap asset responses (the main HTML document,
   // app.js, theme.js, styles.css, favicon, SPA fallback) with the CSP + security
