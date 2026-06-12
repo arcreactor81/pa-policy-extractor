@@ -105,6 +105,7 @@
   var brandProgress = $("brand-progress");
   var progressTrack = $("progress-track");
   var progressFill = $("progress-fill");
+  var progressCount = $("progress-count");
 
   var errorBox = $("error-box");
   var errorMessage = $("error-message");
@@ -528,6 +529,13 @@
     fileSizeEl.textContent = fmtBytes(file.size);
     show(fileMeta);
     dropzone.classList.add("has-file");
+    // Large documents: a dropped connection loses an interactive run entirely
+    // (results only save when the stream finishes). Steer big files to Batch,
+    // which runs server-side, survives disconnects, and saves automatically.
+    var bigNote = $("dz-bigfile-note");
+    if (bigNote) {
+      if (file.size > 4 * 1024 * 1024) { show(bigNote); } else { hide(bigNote); }
+    }
     refreshAnalyzeEnabled();
   }
 
@@ -587,6 +595,7 @@
     run.failedBrands = [];
     if (progressTrack) progressTrack.classList.add("indeterminate");
     if (progressFill) progressFill.style.width = "";
+    if (progressCount) { progressCount.textContent = ""; hide(progressCount); }
 
     // A fresh run invalidates the previous run's digest (built in finalizeRun).
     var summaryEl = document.getElementById("run-summary");
@@ -616,6 +625,9 @@
     if (!run || !run.brands || !run.brands.length) return;
     run.doneBrands = (run.doneBrands || 0) + 1;
     setProgressFill(8 + 90 * (run.doneBrands / run.brands.length));
+    if (progressCount) {
+      progressCount.textContent = run.doneBrands + " of " + run.brands.length + " brands";
+    }
   }
 
   // Drive the elapsed clock via requestAnimationFrame, repainting at most ~10fps
@@ -696,6 +708,10 @@
     // OCR is done once rows exist: switch the track to determinate fill.
     if (progressTrack) progressTrack.classList.remove("indeterminate");
     setProgressFill(8);
+    if (progressCount) {
+      progressCount.textContent = "0 of " + brands.length + " brands";
+      show(progressCount);
+    }
   }
 
   // Ensure progress rows exist even if ocr_done was skipped/out of order.
@@ -1302,8 +1318,13 @@
 
     var bl = q(".score-bucket-label");
     bl.textContent = sm.label;
-    // Plain ink, not the raw stop hex: pastel stops are 2.1-3.2:1 as 16px
-    // text on paper (AA fail); the gauge marker beside it carries the hue.
+    // Label stays AA ink (raw stops are 2.1-3.2:1 as text on paper); the
+    // bucket HUE rides a leading swatch chip instead (user feedback: the
+    // color coding must be visible at a glance, not only in the gauge).
+    var sw = el("span", "bucket-swatch", "");
+    sw.style.background = sm.color;
+    sw.setAttribute("aria-hidden", "true");
+    bl.insertBefore(sw, bl.firstChild);
     q(".score-bucket-meaning").textContent = sm.meaning;
 
     var just = data.access_justification || "No justification was returned by the model.";

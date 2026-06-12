@@ -65,7 +65,7 @@
       <div class="input-headrow">
         <div>
           <h2 id="input-heading" class="panel-title">Analyze a policy</h2>
-          <p class="subtle panel-sub" id="input-sub-single">OCR one policy PDF once, then score it against one or more of the 15 brands. Results stream in live, brand by brand.</p>
+          <p class="subtle panel-sub" id="input-sub-single">OCR one policy PDF once, then score it against one or more of the 15 brands. Results stream in live, brand by brand. For very large PDFs prefer <strong>Batch</strong> &mdash; it runs server-side and survives disconnects.</p>
           <p class="subtle panel-sub" id="input-sub-batch" hidden>Queue several policy PDFs against the brands you pick. The job runs server-side &mdash; reconnectable, shareable by URL, and persistent. Results stream in per PDF.</p>
           <p class="subtle panel-sub" id="input-sub-library" hidden>Browse, search and re-open every analysis you&rsquo;ve run. Filter by brand, filename, access score and date; click a row to reopen the full result; share any analysis by permalink.</p>
           <p class="subtle panel-sub" id="input-sub-ask" hidden>Ask questions across everything you&rsquo;ve analyzed. Answers are generated only from your own saved analyses, web checks and FDA findings, and cite their sources.</p>
@@ -187,8 +187,9 @@
                       d="M12 16V4m0 0L8 8m4-4l4 4M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" />
               </svg>
               <p class="dz-primary">Drag &amp; drop a PDF here</p>
-              <p id="dz-hint" class="dz-secondary">or <span class="link-like">browse files</span> &middot; max 20&nbsp;MB</p>
-              <div id="file-meta" class="file-meta" hidden>
+              <p id="dz-hint" class="dz-secondary">or <span class="link-like">browse files</span> &middot; max 20&nbsp;MB &middot; big PDFs are happier in <strong>Batch</strong></p>
+              <div id="dz-bigfile-note" class="dz-bigfile-note" hidden>Large document &mdash; consider the <strong>Batch</strong> tab: it runs server-side, survives disconnects and tab closes, and saves results to your library automatically.</div>
+            <div id="file-meta" class="file-meta" hidden>
                 <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
                   <path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"
                         d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z M14 3v5h5" />
@@ -333,6 +334,8 @@
           <p class="progress-title">Analyzing <strong id="progress-target"></strong>&hellip;</p>
           <p class="progress-meta">
             Elapsed <span id="elapsed" class="elapsed">0.0s</span>
+            <span class="dot">&middot;</span>
+            <span id="progress-count" class="progress-count" hidden></span>
             <span class="dot">&middot;</span>
             <span class="reassure">First analysis warms the OCR models &mdash; later runs reuse cached OCR. Keep the tab open.</span>
           </p>

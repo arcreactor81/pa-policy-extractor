@@ -674,8 +674,9 @@ main { padding-bottom: 3rem; position: relative; z-index: 1; }
 
 /* ---- overall progress track (indeterminate during OCR, fills per brand) ---- */
 .progress-track {
-  position: relative; height: 5px; border-radius: 3px;
+  position: relative; height: 8px; border-radius: 4px;
   background: var(--surface-3); overflow: hidden;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, .06);
 }
 .progress-fill {
   position: relative; height: 100%; width: 0%;
@@ -1429,11 +1430,9 @@ main { padding-bottom: 3rem; position: relative; z-index: 1; }
 .history-table tbody tr { transition: background var(--dur-fast); }
 .history-table tbody tr:hover { background: var(--surface-3); }
 .score-chip {
-  display: inline-flex; align-items: center; gap: .45rem;
-  min-width: 0; padding: 0;
+  display: inline-block; min-width: 2.5em; text-align: center;
   font-family: var(--mono); font-weight: 600; font-size: .85rem;
   font-variant-numeric: tabular-nums;
-  box-shadow: none;
 }
 .barrier-mini { color: var(--text-muted); font-size: .82rem; max-width: 240px; overflow: hidden; text-overflow: ellipsis; display: inline-block; white-space: nowrap; vertical-align: bottom; }
 
@@ -2387,27 +2386,15 @@ body.cohorts-active .lib-analyses-view { display: none !important; }
 #session-panel .history-table td:nth-child(3),
 .lib-table td:nth-child(3) { font-family: var(--mono); font-variant-numeric: tabular-nums; }
 
-/* (4) Score numerals as plain ink + a colored bucket dot (the approved
-   preview's deviation: raw stop hexes fail AA as text on paper, and a solid
-   chip shouts). The bucket color arrives as an inline style — serialized by
-   the CSSOM to rgb() — so attribute selectors move that hue onto the dot;
-   if a hue ever fails to match, the dot falls back to neutral grey while
-   the numeral stays plain ink. */
+/* Score chips KEEP their bucket-colored fills (user feedback: the color
+   coding is the at-a-glance language of the product). AA holds because the
+   JS ink is #232220 on every fill (4.9-7.5:1); the inset hairline keeps the
+   pastel fills legible on warm paper. The inline background/color come from
+   SCORE_META via JS in all five render sites. */
 .score-chip {
-  background: transparent !important;
-  color: var(--text) !important;
-}
-.score-chip::before {
-  content: ""; flex: 0 0 auto;
-  width: 9px; height: 9px; border-radius: 50%;
-  background: var(--text-faint-decorative);
+  padding: .16rem .6rem; border-radius: 6px;
   box-shadow: inset 0 0 0 1px rgba(0, 0, 0, .14);
 }
-.score-chip[style*="#c97f7f"]::before, .score-chip[style*="rgb(201, 127, 127)"]::before { background: var(--stop-0); }
-.score-chip[style*="#db9f74"]::before, .score-chip[style*="rgb(219, 159, 116)"]::before { background: var(--stop-25); }
-.score-chip[style*="#cdb05e"]::before, .score-chip[style*="rgb(205, 176, 94)"]::before { background: var(--stop-50); }
-.score-chip[style*="#8fae7f"]::before, .score-chip[style*="rgb(143, 174, 127)"]::before { background: var(--stop-75); }
-.score-chip[style*="#6f9a64"]::before, .score-chip[style*="rgb(111, 154, 100)"]::before { background: var(--stop-100); }
 
 /* (5) Result byline: brand as a mono tag, file as a citation. */
 .brand-result-head .result-brand {
@@ -2709,4 +2696,22 @@ body.cohorts-active .lib-analyses-view { display: none !important; }
 @media (prefers-reduced-motion: reduce) {
   .ask-answer-in { animation: none !important; }
   .ask-history-chip { transition: none !important; }
+}
+
+/* === SCORE COLOR + PROGRESS CLARITY (user feedback pass) ==================== */
+/* Colored bucket swatch beside the bucket label: the hue at a glance while the
+   label itself stays AA ink. Inline background set from SCORE_META in JS. */
+.bucket-swatch {
+  display: inline-block; width: 12px; height: 12px; border-radius: 3px;
+  margin-right: .5rem; vertical-align: -1px;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, .14);
+}
+/* "N of M brands" counter in the progress meta line. */
+.progress-count { font-family: var(--mono); font-size: .85rem; color: var(--text); }
+/* Large-document nudge under the dropzone: Batch survives disconnects. */
+.dz-bigfile-note {
+  margin-top: .6rem; padding: .55rem .8rem; border-radius: var(--radius-sm);
+  background: var(--amber-soft); color: var(--amber-text);
+  border: 1px solid color-mix(in srgb, var(--amber) 35%, var(--border));
+  font-size: .85rem; line-height: 1.5;
 }
