@@ -669,7 +669,7 @@ export class JobCoordinator extends DurableObject<Env> {
         void reader.cancel().catch(() => {});
         throw err;
       } finally {
-        clearTimeout(idleTimer);
+        if (idleTimer !== undefined) clearTimeout(idleTimer);
       }
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
