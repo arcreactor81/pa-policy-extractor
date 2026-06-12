@@ -996,6 +996,8 @@
       rect.setAttribute("width", barW); rect.setAttribute("height", c > 0 ? h : 2);
       rect.setAttribute("rx", 4);
       rect.setAttribute("fill", sm.color);
+      rect.setAttribute("stroke", "rgba(0,0,0,.18)");
+      rect.setAttribute("stroke-width", "1");
       rect.setAttribute("opacity", c > 0 ? "0.92" : "0.25");
       var t = PA.svgEl("title");
       t.textContent = sm.label + ": " + c;
@@ -1016,7 +1018,8 @@
         var cnt = PA.svgEl("text");
         cnt.setAttribute("x", x + barW / 2); cnt.setAttribute("y", y - 4);
         cnt.setAttribute("text-anchor", "middle"); cnt.setAttribute("font-size", "11");
-        cnt.setAttribute("font-weight", "700"); cnt.setAttribute("fill", "var(--text)");
+        cnt.setAttribute("font-family", "JetBrains Mono, monospace");
+        cnt.setAttribute("font-weight", "400"); cnt.setAttribute("fill", "var(--text)");
         cnt.textContent = c;
         svg.appendChild(cnt);
       }
@@ -1024,13 +1027,15 @@
       var lbl = PA.svgEl("text");
       lbl.setAttribute("x", x + barW / 2); lbl.setAttribute("y", padT + plotH + 14);
       lbl.setAttribute("text-anchor", "middle"); lbl.setAttribute("font-size", "10");
-      lbl.setAttribute("font-weight", "700"); lbl.setAttribute("fill", "var(--text-muted)");
+      lbl.setAttribute("font-family", "JetBrains Mono, monospace");
+      lbl.setAttribute("font-weight", "400"); lbl.setAttribute("fill", "var(--text-muted)");
       lbl.textContent = stop;
       svg.appendChild(lbl);
 
       var sub = PA.svgEl("text");
       sub.setAttribute("x", x + barW / 2); sub.setAttribute("y", padT + plotH + 26);
       sub.setAttribute("text-anchor", "middle"); sub.setAttribute("font-size", "8");
+      sub.setAttribute("font-family", "JetBrains Mono, monospace");
       sub.setAttribute("fill", "var(--text-faint)");
       sub.textContent = sm.label;
       svg.appendChild(sub);

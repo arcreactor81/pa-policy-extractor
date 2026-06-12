@@ -6,6 +6,9 @@
   <meta name="color-scheme" content="light dark" />
   <meta name="description" content="Prior-Authorization Access Analyzer — Plaque Psoriasis policy extraction with DeepSeek v4-pro + Docling on Cloudflare. OCR a PDF once, analyze many brands, streamed live." />
   <title>Prior-Authorization Access Analyzer</title>
+  <link rel="preload" href="/fonts/instrument-serif-400.woff2" as="font" type="font/woff2" crossorigin />
+  <link rel="preload" href="/fonts/dm-sans-400.woff2" as="font" type="font/woff2" crossorigin />
+  <link rel="preload" href="/fonts/jetbrains-mono-400.woff2" as="font" type="font/woff2" crossorigin />
   <link rel="stylesheet" href="/styles.css" />
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%93%8A%3C/text%3E%3C/svg%3E" />
   <!-- Head bootstrap (same-origin, CSP-safe): flag JS so entrance reveals only
@@ -28,22 +31,16 @@
   <header class="app-header">
     <div class="wrap header-inner">
       <div class="brand-mark reveal stagger" aria-hidden="true">
-        <svg viewBox="0 0 48 48" width="40" height="40" role="img" aria-label="logo">
-          <rect x="3" y="3" width="42" height="42" rx="11" fill="url(#lg)" />
-          <defs>
-            <linearGradient id="lg" x1="0" y1="0" x2="1" y2="1">
-              <stop offset="0" stop-color="#bba8e0" />
-              <stop offset=".55" stop-color="#89b8d4" />
-              <stop offset="1" stop-color="#a8c4a0" />
-            </linearGradient>
-          </defs>
+        <svg viewBox="0 0 48 48" width="32" height="32" role="img" aria-label="logo">
+          <rect x="3" y="3" width="42" height="42" rx="11" fill="currentColor" />
           <rect x="13" y="26" width="5" height="11" rx="1.5" fill="#fff" opacity=".95" />
           <rect x="21.5" y="19" width="5" height="18" rx="1.5" fill="#fff" opacity=".95" />
           <rect x="30" y="12" width="5" height="25" rx="1.5" fill="#fff" opacity=".95" />
         </svg>
       </div>
       <div class="header-text reveal stagger">
-        <h1>Prior-Authorization Access Analyzer</h1>
+        <p class="masthead-kicker">Prior-Authorization Intelligence &middot; Plaque Psoriasis</p>
+        <h1>Prior-Authorization <em>Access</em> Analyzer</h1>
         <p class="subtitle">Plaque Psoriasis policy extraction &middot; DeepSeek v4-pro + Docling on Cloudflare</p>
       </div>
       <button id="theme-toggle" type="button" class="theme-toggle reveal stagger" aria-label="Toggle color theme" title="Toggle light / dark theme">

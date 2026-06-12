@@ -1302,7 +1302,8 @@
 
     var bl = q(".score-bucket-label");
     bl.textContent = sm.label;
-    bl.style.color = sm.color;
+    // Plain ink, not the raw stop hex: pastel stops are 2.1-3.2:1 as 16px
+    // text on paper (AA fail); the gauge marker beside it carries the hue.
     q(".score-bucket-meaning").textContent = sm.meaning;
 
     var just = data.access_justification || "No justification was returned by the model.";
@@ -1382,70 +1383,79 @@
   function renderGauge(svg, score) {
     clearChildren(svg);
 
-    var W = 520, padL = 30, padR = 30, trackY = 46, trackH = 16;
+    // Editorial gauge: thin annotated axis (8px track, rx 2), small hollow
+    // stop markers, a vertical rule + concentric ring annotating the active
+    // stop, and mono axis labels. No blur halo (fadeGlow retired).
+    var W = 520, padL = 30, padR = 30, trackY = 52, trackH = 8;
     var trackW = W - padL - padR;
     var n = SCORE_STOPS.length;
     var segW = trackW / (n - 1);
+    var midY = trackY + trackH / 2;
+    var MONO = "JetBrains Mono, monospace";
 
     var track = svgEl("rect");
     track.setAttribute("x", padL); track.setAttribute("y", trackY);
     track.setAttribute("width", trackW); track.setAttribute("height", trackH);
-    track.setAttribute("rx", trackH / 2);
+    track.setAttribute("rx", 2);
     track.setAttribute("fill", "var(--surface-3)");
     svg.appendChild(track);
 
     var activeIndex = SCORE_STOPS.indexOf(score);
     if (activeIndex === -1) activeIndex = 0;
 
-    // Animated progress fill of the track up to the active stop (scaleX via rAF).
+    // Animated progress fill of the track up to the active stop (rAF width).
     var fillW = segW * activeIndex;
     if (fillW > 0) {
       var fill = svgEl("rect");
       fill.setAttribute("x", padL); fill.setAttribute("y", trackY);
       fill.setAttribute("height", trackH);
-      fill.setAttribute("rx", trackH / 2);
+      fill.setAttribute("rx", 2);
       fill.setAttribute("fill", SCORE_META[score].color);
       svg.appendChild(fill);
       sweepFill(fill, fillW);
     }
-
-    // Animated glow halo behind the active marker (opacity fade-in).
-    var halo = svgEl("circle");
-    var haloCx = padL + segW * activeIndex;
-    halo.setAttribute("cx", haloCx);
-    halo.setAttribute("cy", trackY + trackH / 2);
-    halo.setAttribute("r", 22);
-    halo.setAttribute("fill", SCORE_META[score].color);
-    halo.setAttribute("opacity", "0");
-    halo.style.filter = "blur(8px)";
-    svg.appendChild(halo);
-    fadeGlow(halo, 0.5);
 
     SCORE_STOPS.forEach(function (stop, i) {
       var cx = padL + segW * i;
       var meta = SCORE_META[stop];
       var active = stop === score;
 
+      if (active) {
+        // concentric annotation ring around the active marker
+        var ring = svgEl("circle");
+        ring.setAttribute("cx", cx); ring.setAttribute("cy", midY);
+        ring.setAttribute("r", 13);
+        ring.setAttribute("fill", "none");
+        ring.setAttribute("stroke", meta.color);
+        ring.setAttribute("stroke-width", 1);
+        ring.setAttribute("stroke-opacity", ".35");
+        svg.appendChild(ring);
+      }
+
       var c = svgEl("circle");
-      c.setAttribute("cx", cx); c.setAttribute("cy", trackY + trackH / 2);
-      c.setAttribute("r", active ? 15 : 9);
-      c.setAttribute("fill", active ? meta.color : "var(--surface)");
+      c.setAttribute("cx", cx); c.setAttribute("cy", midY);
+      c.setAttribute("r", active ? 9 : 5);
+      c.setAttribute("fill", active ? meta.color : "var(--surface-solid)");
       c.setAttribute("stroke", meta.color);
-      c.setAttribute("stroke-width", active ? 3 : 2.5);
+      c.setAttribute("stroke-width", active ? 2 : 1.5);
       svg.appendChild(c);
       if (active) popMarker(c);
 
       if (active) {
+        // vertical editorial rule above the active stop (replaces the pin wedge)
         var pin = svgEl("path");
-        pin.setAttribute("d", "M" + cx + " 14 l8 12 h-16 z");
-        pin.setAttribute("fill", meta.color);
+        pin.setAttribute("d", "M" + cx + " 22 v21");
+        pin.setAttribute("fill", "none");
+        pin.setAttribute("stroke", meta.color);
+        pin.setAttribute("stroke-width", 1.5);
         svg.appendChild(pin);
         var lbl = svgEl("text");
-        lbl.setAttribute("x", cx); lbl.setAttribute("y", 10);
+        lbl.setAttribute("x", cx); lbl.setAttribute("y", 14);
         lbl.setAttribute("text-anchor", "middle");
-        lbl.setAttribute("font-size", "11"); lbl.setAttribute("font-weight", "700");
+        lbl.setAttribute("font-family", MONO);
+        lbl.setAttribute("font-size", "11"); lbl.setAttribute("font-weight", "400");
         // Plain ink, not meta.color: pastel stops are 2.1-3.2:1 as text on
-        // light glass; the colored pin/marker beside it carries the hue.
+        // paper; the colored rule/marker beside it carries the hue.
         lbl.setAttribute("fill", "var(--text)");
         lbl.textContent = stop;
         svg.appendChild(lbl);
@@ -1454,8 +1464,9 @@
       var num = svgEl("text");
       num.setAttribute("x", cx); num.setAttribute("y", trackY + trackH + 24);
       num.setAttribute("text-anchor", "middle");
-      num.setAttribute("font-size", "12");
-      num.setAttribute("font-weight", active ? "800" : "600");
+      num.setAttribute("font-family", MONO);
+      num.setAttribute("font-size", "11");
+      num.setAttribute("font-weight", active ? "500" : "400");
       num.setAttribute("fill", active ? "var(--text)" : "var(--text-faint)");
       num.textContent = stop;
       svg.appendChild(num);
@@ -1463,9 +1474,10 @@
       var cap = svgEl("text");
       cap.setAttribute("x", cx); cap.setAttribute("y", trackY + trackH + 40);
       cap.setAttribute("text-anchor", "middle");
-      cap.setAttribute("font-size", "9.5");
+      cap.setAttribute("font-family", MONO);
+      cap.setAttribute("font-size", "10");
       cap.setAttribute("fill", active ? "var(--text)" : "var(--text-faint)");
-      cap.setAttribute("font-weight", active ? "700" : "500");
+      cap.setAttribute("font-weight", active ? "500" : "400");
       cap.textContent = meta.label;
       svg.appendChild(cap);
     });
@@ -1483,18 +1495,6 @@
       rect.setAttribute("width", (eased * targetW).toFixed(1));
       if (t < 1) requestAnimationFrame(frame);
       else rect.setAttribute("width", targetW);
-    }
-    requestAnimationFrame(frame);
-  }
-
-  function fadeGlow(node, targetOpacity) {
-    if (reducedMotion()) { node.setAttribute("opacity", targetOpacity); return; }
-    var dur = 650, start = null;
-    function frame(ts) {
-      if (start == null) start = ts;
-      var t = Math.min(1, (ts - start) / dur);
-      node.setAttribute("opacity", (t * targetOpacity).toFixed(3));
-      if (t < 1) requestAnimationFrame(frame);
     }
     requestAnimationFrame(frame);
   }
@@ -2745,6 +2745,8 @@
       rect.setAttribute("width", barW); rect.setAttribute("height", c > 0 ? h : 2);
       rect.setAttribute("rx", 4);
       rect.setAttribute("fill", SCORE_META[stop].color);
+      rect.setAttribute("stroke", "rgba(0,0,0,.18)");
+      rect.setAttribute("stroke-width", "1");
       rect.setAttribute("opacity", c > 0 ? "0.92" : "0.25");
       var title = svgEl("title");
       title.textContent = SCORE_META[stop].label + ": " + c;
@@ -2766,7 +2768,8 @@
         var cnt = svgEl("text");
         cnt.setAttribute("x", x + barW / 2); cnt.setAttribute("y", y - 4);
         cnt.setAttribute("text-anchor", "middle"); cnt.setAttribute("font-size", "11");
-        cnt.setAttribute("font-weight", "700"); cnt.setAttribute("fill", "var(--text)");
+        cnt.setAttribute("font-family", "JetBrains Mono, monospace");
+        cnt.setAttribute("font-weight", "400"); cnt.setAttribute("fill", "var(--text)");
         cnt.textContent = c;
         svg.appendChild(cnt);
       }
@@ -2774,13 +2777,15 @@
       var lbl = svgEl("text");
       lbl.setAttribute("x", x + barW / 2); lbl.setAttribute("y", padT + plotH + 14);
       lbl.setAttribute("text-anchor", "middle"); lbl.setAttribute("font-size", "10");
-      lbl.setAttribute("font-weight", "700"); lbl.setAttribute("fill", "var(--text-muted)");
+      lbl.setAttribute("font-family", "JetBrains Mono, monospace");
+      lbl.setAttribute("font-weight", "400"); lbl.setAttribute("fill", "var(--text-muted)");
       lbl.textContent = stop;
       svg.appendChild(lbl);
 
       var sub = svgEl("text");
       sub.setAttribute("x", x + barW / 2); sub.setAttribute("y", padT + plotH + 26);
       sub.setAttribute("text-anchor", "middle"); sub.setAttribute("font-size", "8");
+      sub.setAttribute("font-family", "JetBrains Mono, monospace");
       sub.setAttribute("fill", "var(--text-faint)");
       sub.textContent = SCORE_META[stop].label;
       svg.appendChild(sub);
