@@ -380,10 +380,18 @@ describe("POST /api/webcheck validation (no workflow started)", () => {
     params: { Age: "18 years or older" },
   };
 
+  // Unique caller IP per request: without cf-connecting-ip every test request
+  // shares the limiter's "unknown" bucket, and this block alone fires enough
+  // POSTs to trip the 15/min window mid-suite (observed in CI as 429-not-400).
+  let ipSeq = 0;
   function post(body: unknown): Promise<Response> {
+    ipSeq += 1;
     return SELF.fetch("https://example.com/api/webcheck", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "cf-connecting-ip": `198.51.100.${ipSeq}`,
+      },
       body: JSON.stringify(body),
     });
   }
@@ -442,8 +450,18 @@ describe("GET /api/webcheck (persisted verdict)", () => {
   const OWNER_HEADER = "cf-access-authenticated-user-email";
   const bucket = (env as { RESULT_BUCKET: R2Bucket }).RESULT_BUCKET;
 
+  // Same per-request IP isolation as the POST block: keep these GETs out of
+  // the limiter's shared "unknown" bucket so suite-order can't 429 them.
+  let getIpSeq = 0;
+  function wcGet(url: string, headers?: Record<string, string>): Promise<Response> {
+    getIpSeq += 1;
+    return SELF.fetch(url, {
+      headers: { ...(headers ?? {}), "cf-connecting-ip": `198.51.101.${getIpSeq}` },
+    });
+  }
+
   it("404s when no verdict has been persisted for (sha, brand)", async () => {
-    const res = await SELF.fetch(
+    const res = await wcGet(
       `https://example.com/api/webcheck?sha=${"cd".repeat(32)}&brand=TREMFYA`
     );
     expect(res.status).toBe(404);
@@ -452,7 +470,7 @@ describe("GET /api/webcheck (persisted verdict)", () => {
   });
 
   it("400s a malformed sha", async () => {
-    const res = await SELF.fetch(
+    const res = await wcGet(
       "https://example.com/api/webcheck?sha=zz&brand=TREMFYA"
     );
     expect(res.status).toBe(400);
@@ -474,9 +492,9 @@ describe("GET /api/webcheck (persisted verdict)", () => {
         version: 1,
       })
     );
-    const res = await SELF.fetch(
+    const res = await wcGet(
       `https://example.com/api/webcheck?sha=${sha}&brand=TREMFYA`,
-      { headers: { [OWNER_HEADER]: "attacker@example.com" } }
+      { [OWNER_HEADER]: "attacker@example.com" }
     );
     expect(res.status).toBe(404);
   });
@@ -498,9 +516,9 @@ describe("GET /api/webcheck (persisted verdict)", () => {
         version: 1,
       })
     );
-    const res = await SELF.fetch(
+    const res = await wcGet(
       `https://example.com/api/webcheck?sha=${sha}&brand=TREMFYA`,
-      { headers: { [OWNER_HEADER]: owner } }
+      { [OWNER_HEADER]: owner }
     );
     expect(res.status).toBe(200);
     const body = (await res.json()) as { brand?: string; version?: number };
