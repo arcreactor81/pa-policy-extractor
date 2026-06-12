@@ -160,24 +160,27 @@
   }
 
   // =========================================================================
-  // mode switch  (Single / Batch / Library — 3-way)
+  // mode switch  (Single / Batch / Library / Ask — 4-way)
   // =========================================================================
-  // Library mode is owned by public/library.js but driven through this shared
-  // controller so there is one source of truth for body.mode-* classes, the
-  // sliding indicator, tab a11y, sub-copy + pane swaps. Library mode registers a
-  // callback via PA.onModeChange so it can (re)load its browser when activated.
-  var MODE_INDEX = { single: 0, batch: 1, library: 2 };
-  var modeBtns = { single: modeSingleBtn, batch: modeBatchBtn, library: $("mode-library") };
+  // Library mode is owned by public/library.js and Ask mode by public/ask.js,
+  // but both are driven through this shared controller so there is one source
+  // of truth for body.mode-* classes, the sliding indicator, tab a11y,
+  // sub-copy + pane swaps. Library/Ask register callbacks via PA.onModeChange
+  // to react when activated.
+  var MODE_INDEX = { single: 0, batch: 1, library: 2, ask: 3 };
+  var modeBtns = { single: modeSingleBtn, batch: modeBatchBtn, library: $("mode-library"), ask: $("mode-ask") };
   var modeChangeCbs = [];
 
   function setMode(next, opts) {
-    if (next !== "single" && next !== "batch" && next !== "library") return;
+    if (next !== "single" && next !== "batch" && next !== "library" && next !== "ask") return;
     mode = next;
     var batch = next === "batch";
     var library = next === "library";
+    var ask = next === "ask";
     document.body.classList.toggle("mode-batch", batch);
     document.body.classList.toggle("mode-single", next === "single");
     document.body.classList.toggle("mode-library", library);
+    document.body.classList.toggle("mode-ask", ask);
 
     // Tabs: active state + aria-selected + sliding-indicator index.
     Object.keys(modeBtns).forEach(function (m) {
@@ -194,6 +197,7 @@
     toggleHidden($("input-sub-single"), next !== "single");
     toggleHidden($("input-sub-batch"), next !== "batch");
     toggleHidden($("input-sub-library"), next !== "library");
+    toggleHidden($("input-sub-ask"), next !== "ask");
 
     // Swap dropzone panes (single/batch only; library has no picker pane).
     var panes = document.querySelectorAll("[data-mode-pane]");
@@ -217,7 +221,7 @@
     // Move focus to the now-visible primary control for a11y when user-initiated.
     if (!opts || !opts.silent) {
       try {
-        var target = batch ? batchDropzone : library ? $("lib-q") : $("dropzone");
+        var target = batch ? batchDropzone : library ? $("lib-q") : ask ? $("ask-q") : $("dropzone");
         if (target) target.focus();
       } catch (e) { /* ignore */ }
     }
@@ -1272,10 +1276,11 @@
   function bindBatch() {
     if (batchMaxPdfsEl) batchMaxPdfsEl.textContent = String(MAX_PDFS_PER_JOB);
 
-    // Mode switch (3-way: Single / Batch / Library).
+    // Mode switch (4-way: Single / Batch / Library / Ask).
     modeSingleBtn.addEventListener("click", function () { setMode("single"); });
     modeBatchBtn.addEventListener("click", function () { setMode("batch"); });
     if (modeBtns.library) modeBtns.library.addEventListener("click", function () { setMode("library"); });
+    if (modeBtns.ask) modeBtns.ask.addEventListener("click", function () { setMode("ask"); });
 
     // Batch dropzone.
     batchDropzone.addEventListener("click", function (e) {
@@ -1327,6 +1332,12 @@
   // On load: if the URL points at a job (#job-<id>), reconnect to it / render the
   // finished snapshot — the persistent, shareable library behaviour.
   function initFromHash() {
+    // #ask deep-links the Ask tab (symmetry with #job-/#lib/ — answers are
+    // session-only, but the MODE itself is shareable/reload-stable).
+    if (location.hash === "#ask") {
+      setMode("ask", { silent: true });
+      return;
+    }
     var id = jobIdFromHash();
     if (!id) return;
     setMode("batch", { silent: true });
@@ -1346,11 +1357,12 @@
   }
 
   // =========================================================================
-  // shared mode controller surface (consumed by public/library.js)
+  // shared mode controller surface (consumed by public/library.js + ask.js)
   // =========================================================================
-  // Library mode reuses this 3-way switch rather than duplicating body.mode-*
-  // bookkeeping. We expose just enough: drive the active mode, read it, and
-  // subscribe to changes. Namespaced under PA.modes so it is the only new leak.
+  // Library/Ask modes reuse this 4-way switch rather than duplicating
+  // body.mode-* bookkeeping. We expose just enough: drive the active mode,
+  // read it, and subscribe to changes. Namespaced under PA.modes so it is the
+  // only new leak.
   PA.modes = {
     set: function (m, opts) { setMode(m, opts); },
     get: function () { return mode; },

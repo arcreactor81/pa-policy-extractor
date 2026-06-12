@@ -1475,13 +1475,17 @@ main { padding-bottom: 3rem; position: relative; z-index: 1; }
 .mode-tab .mode-tab-hint { font-family: var(--mono); font-size: .65rem; font-weight: 400; opacity: .8; }
 .mode-tab.is-active { color: var(--accent-ink); font-weight: 600; }
 .mode-tab:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
-/* With 3 tabs, force equal widths so the sliding indicator (a fixed third)
+/* With 3+ tabs, force equal widths so the sliding indicator (a fixed Nth)
    aligns exactly under each tab regardless of label length. */
-.mode-switch[data-modes="3"] { width: 100%; max-width: 420px; }
-.mode-switch[data-modes="3"] .mode-tab { flex: 1 1 0; justify-content: center; min-width: 0; }
+.mode-switch[data-modes="3"],
+.mode-switch[data-modes="4"] { width: 100%; max-width: 420px; }
+.mode-switch[data-modes="4"] { max-width: 540px; }
+.mode-switch[data-modes="3"] .mode-tab,
+.mode-switch[data-modes="4"] .mode-tab { flex: 1 1 0; justify-content: center; min-width: 0; }
 /* The sliding pill indicator: sits behind the active tab. Generalized to N
-   tabs via the --mode-idx custom property (0=Single, 1=Batch, 2=Library), set
-   by setMode() in batch.js. The 2-tab fallback is retained for safety. */
+   tabs via the --mode-idx custom property (0=Single, 1=Batch, 2=Library,
+   3=Ask), set by setMode() in batch.js. The 2-tab fallback is retained for
+   safety. */
 .mode-switch-ind {
   position: absolute; z-index: 0; top: 4px; bottom: 4px; left: 4px;
   width: calc(50% - 4px); border-radius: 7px;
@@ -1489,29 +1493,41 @@ main { padding-bottom: 3rem; position: relative; z-index: 1; }
   transition: transform var(--dur) var(--ease-spring);
   --mode-idx: 0;
 }
-/* 3-tab geometry: each tab is a third of the track (minus the 4px inset). The
+/* N-tab geometry: each tab is an Nth of the track (minus the 4px inset). The
    indicator slides by whole tab-widths using its own width as the unit. */
 .mode-switch[data-modes="3"] .mode-switch-ind {
   width: calc((100% - 8px) / 3);
   transform: translateX(calc(var(--mode-idx) * 100%));
 }
+.mode-switch[data-modes="4"] .mode-switch-ind {
+  width: calc((100% - 8px) / 4);
+  transform: translateX(calc(var(--mode-idx) * 100%));
+}
 /* 2-tab fallback (no data-modes / data-modes="2"): keep the original behaviour. */
-.mode-batch .mode-switch:not([data-modes="3"]) .mode-switch-ind { transform: translateX(100%); }
+.mode-batch .mode-switch:not([data-modes="3"]):not([data-modes="4"]) .mode-switch-ind { transform: translateX(100%); }
 
 /* In a given mode, hide the OTHER modes' output panels entirely. */
 .mode-batch .mode-hide-batch { display: none !important; }
 .mode-library .mode-hide-library { display: none !important; }
-/* Single-mode output panels also hidden while in library mode (belt + braces:
-   they carry both .mode-hide-batch and .mode-hide-library). Batch panels show
-   only in batch mode; library panels only in library mode. */
+.mode-ask .mode-hide-ask { display: none !important; }
+/* Single-mode output panels also hidden while in library/ask mode (belt +
+   braces: they carry .mode-hide-batch, .mode-hide-library and .mode-hide-ask).
+   Batch panels show only in batch mode; library panels only in library mode;
+   ask panels only in ask mode. */
 .mode-single .batch-only,
-.mode-library .batch-only { display: none !important; }
+.mode-library .batch-only,
+.mode-ask .batch-only { display: none !important; }
 .mode-single .library-only,
-.mode-batch .library-only { display: none !important; }
-/* Until JS sets a mode class, batch + library panels stay hidden (they also
-   carry [hidden]). */
+.mode-batch .library-only,
+.mode-ask .library-only { display: none !important; }
+.mode-single .ask-only,
+.mode-batch .ask-only,
+.mode-library .ask-only { display: none !important; }
+/* Until JS sets a mode class, batch + library + ask panels stay hidden (batch
+   and library also carry [hidden]; the ask panel is CSS-hidden only). */
 body:not(.mode-batch) .batch-only { display: none !important; }
 body:not(.mode-library) .library-only { display: none !important; }
+body:not(.mode-ask) .ask-only { display: none !important; }
 
 /* --- batch file picker ---------------------------------------------------- */
 .batch-file-list {
@@ -1616,8 +1632,9 @@ body:not(.mode-library) .library-only { display: none !important; }
   .input-headrow { flex-direction: column; }
   .mode-switch { width: 100%; }
   .mode-tab { flex: 1; justify-content: center; }
-  .mode-switch:not([data-modes="3"]) .mode-switch-ind { width: calc(50% - 4px); }
-  .mode-switch[data-modes="3"] { max-width: none; }
+  .mode-switch:not([data-modes="3"]):not([data-modes="4"]) .mode-switch-ind { width: calc(50% - 4px); }
+  .mode-switch[data-modes="3"],
+  .mode-switch[data-modes="4"] { max-width: none; }
 }
 
 /* =========================================================================
@@ -2557,4 +2574,139 @@ body.cohorts-active .lib-analyses-view { display: none !important; }
 @media (prefers-reduced-motion: reduce) {
   .wc-body-in { animation: none !important; }
   .wc-chevron, .wc-toggle { transition: none !important; }
+}
+
+/* === ASK (advisory corpus Q&A) === */
+/* Fourth mode: a question is answered by AI Search over the caller's OWN
+   knowledge digests (saved analyses + web checks), with citations. Direction B
+   voice: serif long-form answer, mono micro-labels at .14em, 6px chips,
+   hairline ledgers, soft amber/red notes. The answer entrance animates
+   opacity/transform only (reduced-motion guarded below). */
+
+/* --- session-only question history chips ---------------------------------- */
+.ask-history {
+  display: flex; align-items: center; flex-wrap: wrap; gap: .5rem;
+  margin: .35rem 0 1rem;
+}
+.ask-history-label {
+  font-family: var(--mono); font-weight: 400; font-size: .62rem;
+  letter-spacing: .14em; text-transform: uppercase; color: var(--text-muted);
+  margin-right: .15rem;
+}
+.ask-history-chip {
+  cursor: pointer; max-width: 100%;
+  font-family: var(--mono); font-weight: 400; font-size: .72rem; letter-spacing: .02em;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  padding: .3rem .65rem; border-radius: 6px;
+  background: var(--surface-2); color: var(--text-muted);
+  border: 1px solid var(--border-strong);
+  transition: color var(--dur-fast), border-color var(--dur-fast), background var(--dur-fast);
+}
+.ask-history-chip:hover { color: var(--text); border-color: var(--primary); }
+.ask-history-chip:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+
+/* --- question form --------------------------------------------------------- */
+.ask-form { display: flex; flex-direction: column; gap: .55rem; }
+.ask-q {
+  width: 100%; box-sizing: border-box; resize: vertical; min-height: 86px;
+  font-family: var(--mono); font-weight: 400; font-size: .88rem; line-height: 1.55;
+  color: var(--text);
+  padding: .65rem .75rem;
+  border: 1px solid var(--border-strong); border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  transition: border-color var(--dur-fast), background var(--dur-fast);
+}
+.ask-q::placeholder { color: var(--text-faint-decorative); }
+.ask-q:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.ask-form-foot {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: .8rem; flex-wrap: wrap;
+}
+.ask-count {
+  font-family: var(--mono); font-weight: 400; font-size: .68rem;
+  letter-spacing: .08em; color: var(--text-faint-decorative);
+}
+.ask-submit { min-width: 132px; }
+
+/* --- setup / rate-limit / failure notes ------------------------------------ */
+.ask-note {
+  margin-top: .9rem; padding: .55rem .75rem;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  font-size: .82rem; line-height: 1.5;
+}
+.ask-note-line { margin: 0; }
+.ask-note-line + .ask-note-line { margin-top: .25rem; }
+.ask-note-hint { font-family: var(--mono); font-size: .72rem; letter-spacing: .02em; }
+.ask-note-amber { background: var(--amber-soft); color: var(--amber-text); }
+.ask-note-red   { background: var(--red-soft);   color: var(--red-text); }
+.ask-note-muted { background: var(--surface-2);  color: var(--text-muted); }
+
+/* --- answer: serif long-form, paragraphs preserved ------------------------- */
+.ask-results:empty { display: none; }
+.ask-results { margin-top: 1.1rem; }
+.ask-answer-p {
+  margin: 0 0 .85rem;
+  font-family: var(--serif); font-weight: 400;
+  font-size: 1.08rem; line-height: 1.65; letter-spacing: .005em;
+  color: var(--text);
+}
+.ask-answer-p:last-child { margin-bottom: 0; }
+.ask-answer-in { animation: askAnswerIn var(--dur) var(--ease-out) both; }
+@keyframes askAnswerIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+/* empty-corpus whisper (mirrors the .lib-empty serif-italic voice) */
+.ask-whisper {
+  margin: .2rem 0 0;
+  font-family: var(--serif); font-style: italic;
+  font-size: 1.02rem; letter-spacing: .01em; color: var(--text-muted);
+}
+
+/* --- SOURCES ledger + citation chips ---------------------------------------- */
+.ask-sources { margin-top: 1rem; padding-top: .75rem; border-top: 1px solid var(--border); }
+.ask-sources-label {
+  display: block; margin-bottom: .5rem;
+  font-family: var(--mono); font-weight: 400; font-size: .68rem;
+  letter-spacing: .14em; text-transform: uppercase; color: var(--text-muted);
+}
+.ask-cite-chips { display: flex; flex-wrap: wrap; gap: .45rem; }
+.ask-cite-chip {
+  cursor: default; max-width: 100%;
+  font-family: var(--mono); font-weight: 400; font-size: .68rem; letter-spacing: .04em;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  padding: .22rem .55rem; border-radius: 6px;
+  background: var(--surface-2); color: var(--text-muted);
+  border: 1px solid var(--border);
+}
+.ask-cite-chip:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+
+/* --- "build the knowledge base" footer ledger ------------------------------- */
+.ask-kb {
+  display: flex; align-items: center; gap: .7rem; flex-wrap: wrap;
+  margin-top: 1.2rem; padding-top: .9rem; border-top: 1px solid var(--border);
+}
+.ask-kb-status {
+  font-family: var(--mono); font-weight: 400; font-size: .72rem;
+  letter-spacing: .02em; color: var(--text-muted);
+}
+.ask-kb-status.is-err { color: var(--red-text); }
+.ask-kb-hint { flex-basis: 100%; margin: 0; }
+
+/* --- mobile ----------------------------------------------------------------- */
+@media (max-width: 640px) {
+  /* hints crowd four tabs anywhere below ~510px, not just 420px; drop them
+     for the whole small range so 'Library / saved' never bleeds into neighbors */
+  .mode-switch[data-modes="4"] .mode-tab .mode-tab-hint { display: none; }
+  /* 4 tabs on a narrow track: tighten tab padding so names stay legible; the
+     indicator geometry is width-based (flex 1 1 0) and unaffected. */
+  .mode-switch[data-modes="4"] .mode-tab { padding-inline: .45rem; gap: .3rem; }
+  .ask-form-foot { flex-direction: column-reverse; align-items: stretch; }
+  .ask-count { text-align: right; }
+  .ask-submit { width: 100%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ask-answer-in { animation: none !important; }
+  .ask-history-chip { transition: none !important; }
 }

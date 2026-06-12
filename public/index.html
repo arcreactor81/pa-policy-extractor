@@ -68,9 +68,10 @@
           <p class="subtle panel-sub" id="input-sub-single">OCR one policy PDF once, then score it against one or more of the 15 brands. Results stream in live, brand by brand.</p>
           <p class="subtle panel-sub" id="input-sub-batch" hidden>Queue several policy PDFs against the brands you pick. The job runs server-side &mdash; reconnectable, shareable by URL, and persistent. Results stream in per PDF.</p>
           <p class="subtle panel-sub" id="input-sub-library" hidden>Browse, search and re-open every analysis you&rsquo;ve run. Filter by brand, filename, access score and date; click a row to reopen the full result; share any analysis by permalink.</p>
+          <p class="subtle panel-sub" id="input-sub-ask" hidden>Ask questions across everything you&rsquo;ve analyzed. Answers are generated only from your own saved analyses, web checks and FDA findings, and cite their sources.</p>
         </div>
-        <!-- MODE SWITCH (Single live / Batch job / Library). Single is default. -->
-        <div class="mode-switch" role="tablist" aria-label="Analysis mode" data-modes="3">
+        <!-- MODE SWITCH (Single live / Batch job / Library / Ask). Single is default. -->
+        <div class="mode-switch" role="tablist" aria-label="Analysis mode" data-modes="4">
           <button id="mode-single" type="button" class="mode-tab is-active" role="tab" aria-selected="true">
             <span class="mode-tab-name">Single</span>
             <span class="mode-tab-hint">live</span>
@@ -82,6 +83,10 @@
           <button id="mode-library" type="button" class="mode-tab" role="tab" aria-selected="false">
             <span class="mode-tab-name">Library</span>
             <span class="mode-tab-hint">saved</span>
+          </button>
+          <button id="mode-ask" type="button" class="mode-tab" role="tab" aria-selected="false">
+            <span class="mode-tab-name">Ask</span>
+            <span class="mode-tab-hint">beta</span>
           </button>
           <span class="mode-switch-ind" aria-hidden="true"></span>
         </div>
@@ -169,7 +174,7 @@
         <p class="hint subtle">Showing analyses saved under your account. Single analyses are saved when they finish; batch analyses are saved server-side when the job completes.</p>
       </div>
 
-      <div class="input-grid mode-hide-library">
+      <div class="input-grid mode-hide-library mode-hide-ask">
         <div class="dropzone-col">
           <!-- SINGLE-PDF picker (unchanged; default mode) -->
           <div class="mode-pane" data-mode-pane="single">
@@ -296,7 +301,7 @@
 
       <!-- CACHED-RESULT HINT (single mode): offered when a matching prior result
            exists in the library, before re-running. Populated by library.js. -->
-      <div id="lib-cache-hint" class="lib-cache-hint mode-hide-batch mode-hide-library" hidden role="status">
+      <div id="lib-cache-hint" class="lib-cache-hint mode-hide-batch mode-hide-library mode-hide-ask" hidden role="status">
         <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
           <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"
                 d="M3 12a9 9 0 1 0 9-9 9 9 0 0 0-7.5 4M3 4v3.5H6.5M12 7v5l3.5 2" />
@@ -313,7 +318,7 @@
     </section>
 
     <!-- STREAM / PROGRESS -->
-    <section id="progress" class="panel progress-panel mode-hide-batch mode-hide-library" aria-live="polite" hidden>
+    <section id="progress" class="panel progress-panel mode-hide-batch mode-hide-library mode-hide-ask" aria-live="polite" hidden>
       <!-- Overall run progress: indeterminate sweep during OCR, then fills as
            brands complete (app.js drives #progress-fill width). -->
       <div id="progress-track" class="progress-track indeterminate" aria-hidden="true">
@@ -358,10 +363,10 @@
     <!-- RUN SUMMARY: post-analysis digest (stat tiles + clickable leaderboard).
          Content is built entirely by renderRunSummary() in app.js once a run
          finishes; hidden again when a new run starts. -->
-    <section id="run-summary" class="panel summary-panel mode-hide-batch mode-hide-library" aria-label="Run summary" hidden></section>
+    <section id="run-summary" class="panel summary-panel mode-hide-batch mode-hide-library mode-hide-ask" aria-label="Run summary" hidden></section>
 
     <!-- GLOBAL ERROR -->
-    <section id="error-box" class="panel error-panel mode-hide-batch mode-hide-library" role="alert" hidden>
+    <section id="error-box" class="panel error-panel mode-hide-batch mode-hide-library mode-hide-ask" role="alert" hidden>
       <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
         <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"
               d="M12 8v5m0 3h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />
@@ -373,7 +378,7 @@
     </section>
 
     <!-- MULTI-BRAND COMPARISON (only when >1 brand) -->
-    <section id="comparison" class="panel comparison-panel reveal mode-hide-batch mode-hide-library" aria-labelledby="comparison-heading" hidden>
+    <section id="comparison" class="panel comparison-panel reveal mode-hide-batch mode-hide-library mode-hide-ask" aria-labelledby="comparison-heading" hidden>
       <h2 id="comparison-heading" class="panel-title">Brand comparison</h2>
       <p class="subtle panel-sub">Access score and key barriers for every brand scored against this policy.</p>
       <div class="table-scroll">
@@ -397,14 +402,14 @@
 
     <!-- BRAND-VS-BRAND HEATMAP (W2): compact score + barrier grid for the
          brands of THIS policy. Inline SVG/CSS, built by analytics.js. -->
-    <section id="single-heatmap" class="panel heatmap-panel reveal mode-hide-batch mode-hide-library" aria-labelledby="single-heatmap-heading" hidden>
+    <section id="single-heatmap" class="panel heatmap-panel reveal mode-hide-batch mode-hide-library mode-hide-ask" aria-labelledby="single-heatmap-heading" hidden>
       <h2 id="single-heatmap-heading" class="panel-title">Brand-vs-brand heatmap</h2>
       <p class="subtle panel-sub">Access score and key barriers for every brand scored against this policy, as a colour-coded grid.</p>
       <div id="single-heatmap-host" class="heatmap-host"></div>
     </section>
 
     <!-- RESULTS: one card per brand, streamed in -->
-    <section id="results" class="results mode-hide-batch mode-hide-library" aria-live="polite" hidden>
+    <section id="results" class="results mode-hide-batch mode-hide-library mode-hide-ask" aria-live="polite" hidden>
       <!-- SAVE / PERMALINK strip: appears once a single analysis is persisted to
            the library. Populated by library.js after the 'done' event. -->
       <div id="lib-save-bar" class="lib-save-bar" hidden>
@@ -783,8 +788,54 @@
 
     <!-- ========================== END LIBRARY MODE ======================= -->
 
+    <!-- ============================== ASK MODE =========================== -->
+    <!-- Advisory Q&A over the caller's OWN knowledge corpus (the digests
+         written for every saved analysis + web check). All Ask UI lives under
+         .ask-only with CSS-driven visibility only (body:not(.mode-ask)
+         .ask-only): no `hidden` attribute here, so nothing has to un-hide the
+         section when the mode switches — same pattern as the Library filter
+         bar above. Behaviour is wired CSP-safely by ask.js. -->
+    <section id="ask-panel" class="panel ask-panel ask-only" aria-labelledby="ask-heading">
+      <h2 id="ask-heading" class="panel-title">Ask your corpus</h2>
+      <p class="subtle panel-sub">Questions are answered from your own analyzed policies, web checks and FDA findings &mdash; with citations. Advisory only; not medical or coverage advice.</p>
+
+      <!-- Session-only question history (max 5, newest first; built by ask.js) -->
+      <div id="ask-history" class="ask-history" role="group" aria-label="Recent questions this session" hidden></div>
+
+      <div class="ask-form">
+        <label class="visually-hidden" for="ask-q">Your question (1 to 1000 characters)</label>
+        <textarea id="ask-q" class="ask-q" rows="3" maxlength="1000"
+                  placeholder="e.g. Which payers require a TB test before approving an IL-23 inhibitor?"></textarea>
+        <div class="ask-form-foot">
+          <span id="ask-count" class="ask-count" aria-hidden="true">0 / 1000</span>
+          <button id="ask-submit" type="button" class="btn btn-primary ask-submit" disabled>
+            <span class="btn-spinner" aria-hidden="true"></span>
+            <svg class="btn-arrow" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+              <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"
+                    d="M5 12h14M13 6l6 6-6 6" />
+            </svg>
+            <span id="ask-submit-label">Ask</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Setup / rate-limit / failure note (one at a time; cleared on next ask) -->
+      <div id="ask-note" class="ask-note" role="status" hidden></div>
+
+      <!-- Answer (serif long-form) + SOURCES citation chips; built by ask.js -->
+      <div id="ask-results" class="ask-results" aria-live="polite"></div>
+
+      <!-- Build the knowledge base from the existing library -->
+      <div class="ask-kb">
+        <button id="ask-backfill" type="button" class="btn btn-ghost btn-sm">Index existing analyses</button>
+        <span id="ask-backfill-status" class="ask-kb-status" role="status"></span>
+        <p class="hint subtle ask-kb-hint">New analyses and web checks are indexed automatically as they finish &mdash; this digests what&rsquo;s already in your library so Ask can cite it.</p>
+      </div>
+    </section>
+    <!-- ============================ END ASK MODE ========================= -->
+
     <!-- SESSION HISTORY / DASHBOARD -->
-    <section id="session-panel" class="panel session-panel reveal mode-hide-batch mode-hide-library" aria-labelledby="session-heading" hidden>
+    <section id="session-panel" class="panel session-panel reveal mode-hide-batch mode-hide-library mode-hide-ask" aria-labelledby="session-heading" hidden>
       <div class="session-head">
         <h2 id="session-heading" class="panel-title">Session analytics</h2>
         <button id="clear-history" type="button" class="btn btn-ghost btn-sm">Clear history</button>
@@ -934,5 +985,6 @@
   <script src="/analytics.js" defer></script>
   <script src="/export.js" defer></script>
   <script src="/cohorts.js" defer></script>
+  <script src="/ask.js" defer></script>
 </body>
 </html>
