@@ -369,13 +369,9 @@ def _chat(base_url: str, headers: dict, model: str, *,
         if attempt < max_retries - 1:
             time.sleep(2 * (attempt + 1))
 
-    error = TransientLLMError(
-        f"{provider} call failed after {max_retries} attempts",
-        outcome="transient_exhausted",
-    )
-    if last_err is None:
-        raise error
-    raise error from last_err
+    raise RuntimeError(
+        f"{provider} call failed after {max_retries} attempts: {last_err}"
+    ) from last_err
 
 
 def chat(system_instruction: str, user_prompt: str,

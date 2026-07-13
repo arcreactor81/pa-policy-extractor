@@ -196,6 +196,11 @@ def extract_spans(policy_text: str, params_or_row: dict, brand: str) -> dict:
     Returns { "<column>": {"found": bool, "quotes": [str, ...]} } keyed by the 13
     deliverable column display names. NEVER raises: any failure (no policy text,
     LLM error, garbled / non-conforming JSON) degrades to a found=false map.
+
+    llm.chat retries its explicit transport/status/length transient classes, but
+    a malformed successful response raises InvalidLLMResponseError after exactly
+    one HTTP attempt. This advisory pass catches that error here and returns the
+    empty map rather than adding an outer retry layer.
     """
     spans = _empty_spans()
     if not policy_text or not str(policy_text).strip():

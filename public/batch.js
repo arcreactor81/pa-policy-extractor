@@ -1246,6 +1246,17 @@
   // =========================================================================
   // finished-results snapshot (GET /api/results?jobId=..)
   // =========================================================================
+  function loadJobState(jobId) {
+    return fetch("/api/jobs/" + encodeURIComponent(jobId), {
+      headers: { "Accept": "application/json" }
+    }).then(function (resp) {
+      if (!resp.ok) return null;
+      return resp.json();
+    }).catch(function () {
+      return null;
+    });
+  }
+
   // Used as a fallback render path for an already-finished job (e.g. opened via
   // a shared link long after completion, when the WS would just replay anyway).
   function loadFinishedResults(jobId) {
@@ -1549,18 +1560,25 @@
     var id = jobIdFromHash();
     if (!id) return;
     setMode("batch", { silent: true });
-    // Try a fast finished-results render first; if absent, open the live stream
-    // (which, starting from seq 0, replays the FULL event log so a mid-job
-    // reload rebuilds every already-completed PDF's section + brand card).
+
+    // A results object is written during finalization, before the durable job
+    // becomes terminal. Confirm terminal completion from the coordinator first;
+    // running or failed jobs must replay their authoritative event stream.
     job = newJobState(id);
     jobPanel.hidden = false;
     setConn("connecting");
     setStatusText("Loading saved job…");
-    loadFinishedResults(id).then(function (rendered) {
-      if (!rendered) {
-        // Not finished (or no snapshot yet) — open the reconnectable stream.
-        startJob(id, { fresh: false });
+    loadJobState(id).then(function (state) {
+      if (!job || job.id !== id) return;
+      if (state && (state.status === "complete" || state.status === "done")) {
+        loadFinishedResults(id).then(function (rendered) {
+          if (!rendered && job && job.id === id) {
+            startJob(id, { fresh: false });
+          }
+        });
+        return;
       }
+      startJob(id, { fresh: false });
     });
   }
 

@@ -1298,10 +1298,32 @@ describe("abandonment split", () => {
       }),
     ]);
 
+    const abandonedPdfEvents = snapshot.events.filter(
+      (event) =>
+        event.event_type === "error" &&
+        event.pdf_index === 1
+    );
+    expect(abandonedPdfEvents).toHaveLength(1);
+    expect(abandonedPdfEvents[0].attempt).toBe(1);
+    const abandonedPdfPayload = JSON.parse(
+      abandonedPdfEvents[0].payload
+    ) as Record<string, unknown>;
+    expect(abandonedPdfPayload).toMatchObject({
+      event: "error",
+      error:
+        "abandoned: job never completed (instance churn)",
+      pdf_index: 1,
+      filename: pendingFilename,
+      seq_num: abandonedPdfEvents[0].seq_num,
+    });
+
     const doneEvents = snapshot.events.filter(
       (event) => event.event_type === "job_done"
     );
     expect(doneEvents).toHaveLength(1);
+    expect(abandonedPdfEvents[0].seq_num).toBeLessThan(
+      doneEvents[0].seq_num
+    );
     const donePayload = JSON.parse(
       doneEvents[0].payload
     ) as Record<string, unknown>;
@@ -1368,6 +1390,11 @@ describe("abandonment split", () => {
       finalization_error:
         "abandoned: finalization-time ceiling",
     });
+    expect(
+      snapshot.events.filter(
+        (event) => event.event_type === "error"
+      )
+    ).toHaveLength(0);
 
     const doneEvents = snapshot.events.filter(
       (event) => event.event_type === "job_done"
@@ -1429,11 +1456,38 @@ describe("abandonment split", () => {
         status: string;
         summary_json: string | null;
       }>();
-    expect(cohortRun).toEqual({
-      status: "running",
-      summary_json: null,
+    expect(cohortRun?.status).toBe("failed");
+    const summary = JSON.parse(
+      cohortRun?.summary_json ?? "{}"
+    ) as Record<string, unknown>;
+    expect(summary).toEqual({
+      cohort_id: seed.cohortId,
+      run_id: seed.runId,
+      job_id: seed.jobId,
+      status: "failed",
+      totals: {
+        total_pdfs: 1,
+        completed_pdfs: 1,
+        failed_pdfs: 0,
+      },
+      per_brand_access: {
+        TREMFYA: 50,
+        SKYRIZI: 75,
+      },
     });
-    expect(fetchMock).not.toHaveBeenCalled();
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe(WEBHOOK_URL);
+    const webhookInit = fetchMock.mock.calls[0][1];
+    const webhookHeaders = new Headers(
+      webhookInit?.headers
+    );
+    expect(webhookHeaders.get("Idempotency-Key")).toBe(
+      `pa-policy-extractor/cohort-run/${seed.runId}`
+    );
+    expect(
+      JSON.parse(String(webhookInit?.body))
+    ).toEqual(summary);
 
     await cleanupJob(seed);
   });

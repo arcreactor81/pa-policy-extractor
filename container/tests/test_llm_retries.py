@@ -5,7 +5,7 @@ import logging
 
 import pytest
 
-from pipeline import llm
+from pipeline import explain, llm
 
 
 _DEFAULT_PAYLOAD = object()
@@ -67,6 +67,24 @@ def _capture_sleeps(monkeypatch):
     return sleeps
 
 
+def _minimal_score_row():
+    return {
+        "Brand": "TREMFYA",
+        "Age": "NA",
+        "Step Therapy Requirements Documented in Policy": "NA",
+        "Number of Steps through Brands": "NA",
+        "Number of Steps through Generic": "NA",
+        "Step through-Phototherapy": "NA",
+        "TB Test required": "NA",
+        "Quantity Limits": "NA",
+        "Specialist Types": "NA",
+        "Initial Authorization Duration(in-months)": "NA",
+        "Reauthorization Duration(in-months)": "NA",
+        "Reauthorization Required": "NA",
+        "Reauthorization Requirements Documented in Policy": "NA",
+    }
+
+
 def test_error_hierarchy_remains_runtime_error_compatible():
     assert issubclass(llm.LLMError, RuntimeError)
     assert issubclass(llm.PermanentLLMError, llm.LLMError)
@@ -108,9 +126,13 @@ def test_retryable_http_statuses_exhaust_inner_budget(
     sleeps = _capture_sleeps(monkeypatch)
     caplog.set_level(logging.INFO, logger="pa-extractor.llm")
 
-    with pytest.raises(llm.TransientLLMError) as caught:
+    with pytest.raises(RuntimeError) as caught:
         _call()
 
+    assert type(caught.value) is RuntimeError
+    assert str(caught.value) == (
+        f"test call failed after 3 attempts: test returned HTTP {status}"
+    )
     assert len(calls) == 3
     assert sleeps == [2, 4]
     assert isinstance(caught.value.__cause__, llm.TransientLLMError)
@@ -207,9 +229,14 @@ def test_four_class_transport_whitelist_is_retried(
     sleeps = _capture_sleeps(monkeypatch)
     caplog.set_level(logging.INFO, logger="pa-extractor.llm")
 
-    with pytest.raises(llm.TransientLLMError):
+    with pytest.raises(RuntimeError) as caught:
         _call()
 
+    assert type(caught.value) is RuntimeError
+    assert str(caught.value) == (
+        "test call failed after 3 attempts: transport failed"
+    )
+    assert isinstance(caught.value.__cause__, error_type)
     assert len(calls) == 3
     assert sleeps == [2, 4]
     attempt_logs = [
@@ -260,6 +287,23 @@ def test_missing_secondary_config_is_permanent_with_stable_messages(monkeypatch)
     assert str(caught.value) == "secondary base URL is not configured."
 
 
+def test_explain_malformed_success_degrades_after_one_http_attempt(monkeypatch):
+    malformed = _Response(payload={"choices": []})
+    calls = _install_sequence(monkeypatch, [malformed, malformed, malformed])
+    sleeps = _capture_sleeps(monkeypatch)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+
+    spans = explain.extract_spans(
+        "The policy contains no relevant source quote.",
+        {},
+        "TREMFYA",
+    )
+
+    assert spans == explain._empty_spans()
+    assert len(calls) == 1
+    assert sleeps == []
+
+
 def test_outer_attempt_context_is_threaded_from_core(core_mod, monkeypatch):
     seen = []
 
@@ -275,20 +319,56 @@ def test_outer_attempt_context_is_threaded_from_core(core_mod, monkeypatch):
     assert seen == [("extract", 1), ("extract", 2), ("extract", 3)]
 
 
-def test_permanent_failure_short_circuits_outer_retry(core_mod, monkeypatch):
-    calls = []
+def test_permanent_failure_short_circuits_into_sanitized_paths(
+        core_mod, monkeypatch):
+    primary_calls = []
+    secondary_calls = []
     permanent = llm.PermanentLLMError("permanent")
+
+    def _primary(*args, **kwargs):
+        primary_calls.append(kwargs)
+        raise permanent
+
+    def _secondary(*args, **kwargs):
+        secondary_calls.append(kwargs)
+        raise permanent
+
+    monkeypatch.setattr(core_mod.llm, "chat", _primary)
+    monkeypatch.setattr(core_mod.llm, "chat_secondary", _secondary)
+
+    with pytest.raises(RuntimeError, match=r"^extraction failed$") as caught:
+        core_mod._extract_params("policy", "TREMFYA")
+    assert type(caught.value) is RuntimeError
+    assert len(primary_calls) == 1
+
+    with pytest.raises(
+        RuntimeError, match=r"^validator extraction failed$"
+    ) as caught:
+        core_mod._extract_params_secondary(
+            "policy", "TREMFYA", model="@cf/test"
+        )
+    assert type(caught.value) is RuntimeError
+    assert len(secondary_calls) == 1
+
+
+def test_permanent_scoring_failure_uses_boundary_fallback(
+        core_mod, monkeypatch):
+    calls = []
 
     def _chat(*args, **kwargs):
         calls.append(kwargs)
-        raise permanent
+        raise llm.PermanentLLMError("permanent")
 
     monkeypatch.setattr(core_mod.llm, "chat", _chat)
 
-    with pytest.raises(llm.PermanentLLMError) as caught:
-        core_mod._extract_params("policy", "TREMFYA")
+    score, justification = core_mod._access_score(
+        _minimal_score_row(), "policy", brand="TREMFYA"
+    )
 
-    assert caught.value is permanent
+    assert score == 0
+    assert justification == (
+        "(model scoring failed: permanent; boundary default applied)"
+    )
     assert len(calls) == 1
 
 
@@ -310,23 +390,8 @@ def test_core_labels_validator_and_score_operations(core_mod, monkeypatch):
         core_mod._extract_params_secondary("policy", "TREMFYA", model="@cf/test"),
         dict,
     )
-    score_row = {
-        "Brand": "TREMFYA",
-        "Age": "NA",
-        "Step Therapy Requirements Documented in Policy": "NA",
-        "Number of Steps through Brands": "NA",
-        "Number of Steps through Generic": "NA",
-        "Step through-Phototherapy": "NA",
-        "TB Test required": "NA",
-        "Quantity Limits": "NA",
-        "Specialist Types": "NA",
-        "Initial Authorization Duration(in-months)": "NA",
-        "Reauthorization Duration(in-months)": "NA",
-        "Reauthorization Required": "NA",
-        "Reauthorization Requirements Documented in Policy": "NA",
-    }
     score, _ = core_mod._access_score(
-        score_row, "policy", brand="TREMFYA"
+        _minimal_score_row(), "policy", brand="TREMFYA"
     )
     assert score == 50
     assert seen == [("validator_extract", 1), ("score", 1)]

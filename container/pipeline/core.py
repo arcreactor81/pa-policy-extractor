@@ -482,8 +482,9 @@ def _extract_params(policy_text: str, brand: str) -> dict:
                             operation="extract", outer_attempt=outer_attempt)
             params = parse_json_response(text)
             return validate_and_normalize(params, brand)
-        except llm.PermanentLLMError:
-            raise
+        except llm.PermanentLLMError as e:
+            last_err = e
+            break
         except Exception as e:  # noqa: BLE001
             last_err = e
             continue
@@ -523,8 +524,9 @@ def _extract_params_secondary(policy_text: str, brand: str, model: str = None) -
                                       outer_attempt=outer_attempt)
             params = parse_json_response(text)
             return validate_and_normalize(params, brand)
-        except llm.PermanentLLMError:
-            raise
+        except llm.PermanentLLMError as e:
+            last_err = e
+            break
         except Exception as e:  # noqa: BLE001
             last_err = e
             continue
@@ -570,8 +572,9 @@ def _access_score(row: dict, policy_text: str, brand: str = "") -> tuple:
             score = cand
             justification = str(data.get("justification", "")).strip()
             break
-        except llm.PermanentLLMError:
-            raise
+        except llm.PermanentLLMError as e:
+            last_err = e
+            break
         except Exception as e:  # noqa: BLE001
             last_err = e
             continue

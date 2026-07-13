@@ -507,7 +507,7 @@ export class JobCoordinator extends DurableObject<Env> {
    * scheduled by runJob once the job is terminal), and kick off processing in
    * the background (waitUntil so the 202 returns immediately).
    */
-  private handleStart(body: StartJobBody): Response {
+  private async handleStart(body: StartJobBody): Promise<Response> {
     const sql = this.ctx.storage.sql;
 
     // Idempotency: if this job was already started, do nothing (the Worker may
@@ -565,15 +565,15 @@ export class JobCoordinator extends DurableObject<Env> {
       );
     }
 
+    // Process in the background so the control-plane call returns instantly.
+    // Register the work before awaiting the alarm write so a storage error cannot
+    // leave the newly persisted job without an in-flight processing attempt.
+    this.ctx.waitUntil(this.runJob(body.jobId, config));
+
     // WATCHDOG alarm (not retention): while the job is non-terminal the alarm
     // slot guards against a DO restart orphaning the waitUntil-driven
-    // processing below. runJob schedules the retention alarm once terminal.
-    void this.ctx.storage.setAlarm(createdAt + WATCHDOG_MS);
-
-    // Process in the background so the control-plane call returns instantly.
-    // waitUntil keeps the DO alive until processing finishes even though fetch
-    // has returned.
-    this.ctx.waitUntil(this.runJob(body.jobId, config));
+    // processing above. runJob schedules the retention alarm once terminal.
+    await this.rearmAlarmDurably(createdAt + WATCHDOG_MS);
 
     return new Response(JSON.stringify({ ok: true }), {
       headers: { "content-type": "application/json" },
@@ -607,15 +607,38 @@ export class JobCoordinator extends DurableObject<Env> {
         rows.length &&
         (rows[0].status === "complete" || rows[0].status === "failed")
       ) {
-        this.scheduleRetention(rows[0].created_at);
+        await this.scheduleRetention(rows[0].created_at);
       }
     }
   }
 
+  /**
+   * Await an alarm write so recovery does not depend on a rejected background
+   * promise being retried by the runtime. When preserving an existing error,
+   * log an alarm-write failure without replacing the error the caller will
+   * propagate.
+   */
+  private async rearmAlarmDurably(
+    scheduledAt: number,
+    preserveOriginalError = false
+  ): Promise<void> {
+    try {
+      await this.ctx.storage.setAlarm(scheduledAt);
+    } catch (alarmError) {
+      if (!preserveOriginalError) {
+        throw alarmError;
+      }
+      console.error(
+        "job alarm re-arm failed; preserving original error:",
+        alarmError
+      );
+    }
+  }
+
   /** Arm retention from the immutable job creation timestamp. */
-  private scheduleRetention(createdAt: number): void {
+  private async scheduleRetention(createdAt: number): Promise<void> {
     const retentionDays = Number(this.env.RETENTION_DAYS ?? "7") || 7;
-    void this.ctx.storage.setAlarm(
+    await this.rearmAlarmDurably(
       Math.max(
         Date.now() + 1000,
         createdAt + retentionDays * 24 * 60 * 60 * 1000
@@ -1668,28 +1691,40 @@ export class JobCoordinator extends DurableObject<Env> {
           diagnosticError
         );
       }
-      void this.ctx.storage.setAlarm(Date.now() + WATCHDOG_MS);
+      await this.rearmAlarmDurably(
+        Date.now() + WATCHDOG_MS,
+        true
+      );
       throw error;
     }
   }
 
   /**
-   * Mark every non-terminal PDF failed, recompute job counters from the source
-   * rows, and persist the abandonment marker atomically.
+   * Mark every non-terminal PDF failed, recompute job counters, persist one
+   * per-PDF error event, and store the abandonment marker atomically. Broadcast
+   * only after commit so live clients and replay observe the same transitions.
    */
   private markRemainingPdfsFailed(
     jobId: string,
     pdfError: string,
     jobMarker: string
   ): void {
-    this.ctx.storage.transactionSync(() => {
-      this.ctx.storage.sql.exec(
-        `UPDATE job_pdfs
-         SET status = 'failed',
-             error = COALESCE(error, ?)
-         WHERE status NOT IN ('complete','failed')`,
-        pdfError
-      );
+    const appended = this.ctx.storage.transactionSync(() => {
+      const failedRows = this.ctx.storage.sql
+        .exec<{
+          pdf_index: number;
+          filename: string;
+          attempt: number;
+          error: string | null;
+        }>(
+          `UPDATE job_pdfs
+           SET status = 'failed',
+               error = COALESCE(error, ?)
+           WHERE status NOT IN ('complete','failed')
+           RETURNING pdf_index, filename, attempt, error`,
+          pdfError
+        )
+        .toArray();
 
       const counts = this.ctx.storage.sql
         .exec<{
@@ -1714,7 +1749,67 @@ export class JobCoordinator extends DurableObject<Env> {
         jobMarker,
         jobId
       );
+
+      return failedRows.map((pdf) =>
+        this.appendEvent(
+          pdf.pdf_index,
+          pdf.filename,
+          {
+            event: "error",
+            error: pdf.error ?? pdfError,
+          },
+          pdf.attempt
+        )
+      );
     });
+
+    for (const event of appended) {
+      this.broadcast(jobId, event.envelope, event.seq);
+    }
+  }
+
+  /**
+   * Forced abandonment cannot remain hard-gated on an unavailable cohort store
+   * or webhook. Make one best-effort failed-status reconciliation attempt before
+   * the terminal commit; each failure is logged and cannot block abandonment.
+   */
+  private async reconcileForcedAbandonment(
+    jobId: string,
+    config: JobConfig
+  ): Promise<void> {
+    if (!config.cohort_id || !config.run_id) return;
+
+    let data: FinalizationData;
+    try {
+      data = this.readFinalizationData(jobId, config);
+    } catch (error) {
+      console.error(
+        `forced abandonment summary failed: ${sanitizeFinalizationError(error)}`
+      );
+      return;
+    }
+
+    try {
+      await this.persistCohortStage(jobId, config, data);
+    } catch (error) {
+      console.error(
+        `forced abandonment cohort reconciliation failed: ${sanitizeFinalizationError(error)}`
+      );
+    }
+
+    if (config.webhook_url) {
+      try {
+        await this.postWebhook(
+          config.webhook_url,
+          this.cohortSummary(jobId, config, data),
+          config.run_id
+        );
+      } catch (error) {
+        console.error(
+          `forced abandonment webhook failed: ${sanitizeFinalizationError(error)}`
+        );
+      }
+    }
   }
 
   /**
@@ -1811,6 +1906,8 @@ export class JobCoordinator extends DurableObject<Env> {
       }
     }
 
+    await this.reconcileForcedAbandonment(jobId, config);
+
     const refreshed = this.ctx.storage.sql
       .exec<{
         total_pdfs: number;
@@ -1843,7 +1940,7 @@ export class JobCoordinator extends DurableObject<Env> {
 
   // ── GET /state (poll) ───────────────────────────────────────────────────────
 
-  private handleState(): Response {
+  private async handleState(): Promise<Response> {
     const sql = this.ctx.storage.sql;
 
     const jobRows = sql
@@ -1860,13 +1957,18 @@ export class JobCoordinator extends DurableObject<Env> {
     const config = JSON.parse(job.config_json) as JobConfig;
 
     // Poll-triggered self-heal applies equally to extraction and persisted
-    // finalization stages.
+    // finalization stages. Never postpone an earlier alarm: a poller running
+    // faster than this delay must not starve the watchdog indefinitely.
     if (
       job.status !== "complete" &&
       job.status !== "failed" &&
       !this.processing
     ) {
-      void this.ctx.storage.setAlarm(Date.now() + 5_000);
+      const selfHealAt = Date.now() + 5_000;
+      const alarmAt = await this.ctx.storage.getAlarm();
+      if (alarmAt === null || alarmAt > selfHealAt) {
+        await this.rearmAlarmDurably(selfHealAt);
+      }
     }
 
     const pdfRows = sql
@@ -2085,7 +2187,7 @@ export class JobCoordinator extends DurableObject<Env> {
             const startedAt = row.finalized_at ?? row.created_at;
             if (Date.now() - startedAt > MAX_JOB_AGE_MS) {
               await this.forceFinalizationAbandonment(jobId, config);
-              this.scheduleRetention(row.created_at);
+              await this.scheduleRetention(row.created_at);
               return;
             }
 
@@ -2154,7 +2256,7 @@ export class JobCoordinator extends DurableObject<Env> {
           }
         }
 
-        void this.ctx.storage.setAlarm(Date.now() + WATCHDOG_MS);
+        await this.rearmAlarmDurably(Date.now() + WATCHDOG_MS);
         return;
       }
 
@@ -2163,7 +2265,7 @@ export class JobCoordinator extends DurableObject<Env> {
       const retentionAt =
         row.created_at + retentionDays * 24 * 60 * 60 * 1000;
       if (Date.now() < retentionAt) {
-        void this.ctx.storage.setAlarm(retentionAt);
+        await this.rearmAlarmDurably(retentionAt);
         return;
       }
 
@@ -2179,10 +2281,10 @@ export class JobCoordinator extends DurableObject<Env> {
       // the alarm, so we won't fire again.
       await this.ctx.storage.deleteAll();
     } catch (err) {
-      // Idempotency: on ANY failure, reschedule the alarm to retry shortly so
+      // Idempotency: on ANY failure, persist a retry alarm before returning so
       // we never leak R2 objects or strand a non-terminal finalization.
       console.error("job alarm failed; rescheduling:", err);
-      void this.ctx.storage.setAlarm(Date.now() + 60 * 60 * 1000); // +1h
+      await this.rearmAlarmDurably(Date.now() + 60 * 60 * 1000); // +1h
     }
   }
 }

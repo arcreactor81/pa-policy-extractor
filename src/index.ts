@@ -831,7 +831,7 @@ async function extendStageMarker(
       env,
       uploadId,
       next,
-      loaded.object.httpEtag
+      loaded.object.etag
     );
     if (written) return "extended";
   }
@@ -1162,7 +1162,7 @@ async function persistStartedStage(
       env,
       uploadId,
       started,
-      loaded?.object.httpEtag
+      loaded?.object.etag
     );
     if (written) return;
   }
@@ -1212,7 +1212,7 @@ async function handleStartStage(
         env,
         uploadId,
         committing,
-        loaded.object.httpEtag
+        loaded.object.etag
       );
       if (written) {
         loaded = { marker: committing, object: written };
