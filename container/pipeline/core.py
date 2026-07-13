@@ -580,9 +580,11 @@ def _access_score(row: dict, policy_text: str, brand: str = "") -> tuple:
             continue
 
     if score is None:
-        # Couldn't get a model bucket; fall back to the deterministic boundary.
+        # Keep classified/provider detail server-side; the justification is
+        # included in result events and must remain safe for clients.
+        log.error("access scoring failed for brand %s: %s", brand, last_err)
         score, reason = consistency_check(row, 0)
-        return score, f"(model scoring failed: {last_err}; boundary default applied)"
+        return score, "(model scoring failed; boundary default applied)"
 
     # Deterministic coverage-boundary override (covered!=0, uncovered!=>0).
     score, override_reason = consistency_check(row, score)

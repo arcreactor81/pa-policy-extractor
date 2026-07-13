@@ -1008,6 +1008,128 @@ describe("durable idempotent finalization", () => {
   );
 });
 
+describe("poll self-heal alarm scheduling", () => {
+  it("preserves a finalization retry alarm and recreates it only when missing", async () => {
+    const seed = await seedFinalizationJob({
+      state: "cohort_committed",
+    });
+    const retryAt = Date.now() + TEST_ALARM_DELAY_MS;
+
+    await runInDurableObject(
+      seed.stub,
+      async (_instance, state) => {
+        await state.storage.setAlarm(retryAt);
+      }
+    );
+
+    const polled = await getPollState(seed.stub);
+    expect(polled.status).toBe("running");
+    expect(polled.finalize_state).toBe(
+      "cohort_committed"
+    );
+
+    const preserved = await runInDurableObject(
+      seed.stub,
+      async (_instance, state) => state.storage.getAlarm()
+    );
+    expect(preserved).toBe(retryAt);
+
+    await runInDurableObject(
+      seed.stub,
+      async (_instance, state) => {
+        await state.storage.deleteAlarm();
+      }
+    );
+
+    const before = Date.now();
+    await getPollState(seed.stub);
+    const after = Date.now();
+    const recreated = await runInDurableObject(
+      seed.stub,
+      async (_instance, state) => state.storage.getAlarm()
+    );
+
+    expect(recreated).not.toBeNull();
+    expect(recreated as number).toBeGreaterThanOrEqual(
+      before + 4_000
+    );
+    expect(recreated as number).toBeLessThanOrEqual(
+      after + 6_000
+    );
+
+    await cleanupJob(seed);
+  });
+
+  it("preserves a near extraction alarm but pulls a distant one forward", async () => {
+    const seed = await seedFinalizationJob({
+      state: "prepared",
+    });
+
+    await runInDurableObject(
+      seed.stub,
+      async (_instance, state) => {
+        state.storage.sql.exec(
+          `UPDATE jobs
+           SET finalization_state = 'none',
+               final_status = NULL,
+               finalized_at = NULL,
+               finalization_error = NULL
+           WHERE id = ?`,
+          seed.jobId
+        );
+      }
+    );
+
+    const nearAt = Date.now() + 1_000;
+    await runInDurableObject(
+      seed.stub,
+      async (_instance, state) => {
+        await state.storage.setAlarm(nearAt);
+      }
+    );
+
+    const nearPoll = await getPollState(seed.stub);
+    expect(nearPoll.status).toBe("running");
+    expect(nearPoll.finalize_state).toBeUndefined();
+
+    const preserved = await runInDurableObject(
+      seed.stub,
+      async (_instance, state) => state.storage.getAlarm()
+    );
+    expect(preserved).toBe(nearAt);
+
+    const distantAt =
+      Date.now() + TEST_ALARM_DELAY_MS;
+    await runInDurableObject(
+      seed.stub,
+      async (_instance, state) => {
+        await state.storage.setAlarm(distantAt);
+      }
+    );
+
+    const before = Date.now();
+    await getPollState(seed.stub);
+    const after = Date.now();
+    const pulledForward = await runInDurableObject(
+      seed.stub,
+      async (_instance, state) => state.storage.getAlarm()
+    );
+
+    expect(pulledForward).not.toBeNull();
+    expect(pulledForward as number).toBeLessThan(
+      distantAt
+    );
+    expect(pulledForward as number).toBeGreaterThanOrEqual(
+      before + 4_000
+    );
+    expect(pulledForward as number).toBeLessThanOrEqual(
+      after + 6_000
+    );
+
+    await cleanupJob(seed);
+  });
+});
+
 describe("finalization invariants", () => {
   it("fails the library stage when result events have no file_sha256", async () => {
     const seed = await seedFinalizationJob({
@@ -1483,7 +1605,7 @@ describe("abandonment split", () => {
       webhookInit?.headers
     );
     expect(webhookHeaders.get("Idempotency-Key")).toBe(
-      `pa-policy-extractor/cohort-run/${seed.runId}`
+      `pa-policy-extractor/cohort-run/${seed.runId}/abandoned`
     );
     expect(
       JSON.parse(String(webhookInit?.body))

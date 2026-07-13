@@ -219,13 +219,14 @@
     // route (otherwise the identity header is spoofable).
   },
 
-  // W5 (saved cohorts) — budget-safe daily cron. The Worker's scheduled() handler
-  // re-runs ONLY cohorts that opted in (schedule_enabled=1). With nothing opted
-  // in it is an INERT, near-zero-cost daily D1 check (one indexed SELECT that
-  // returns no rows — no container is woken, no job is created). COST: each
-  // scheduled cohort that DOES run stages its PDFs into a new batch job and so
-  // spends container vCPU-minutes (same cost as a manual "Run now"); this is why
-  // the per-cohort toggle is OFF by default. Cron runs at 06:00 UTC daily.
+  // Daily maintenance plus W5 scheduled cohorts. The Worker's scheduled()
+  // handler prunes expired library rows, sweeps expired staged-upload markers
+  // and their deterministic PDF objects, then re-runs ONLY cohorts that opted
+  // in (schedule_enabled=1). With nothing to prune, sweep, or re-run it performs
+  // bounded D1/R2 checks and wakes no container. Each scheduled cohort that
+  // DOES run stages its PDFs into a new batch job and costs the same as a manual
+  // "Run now", which is why the per-cohort toggle is OFF by default.
+  // Cron runs at 06:00 UTC daily.
   "triggers": {
     "crons": ["0 6 * * *"]
   },

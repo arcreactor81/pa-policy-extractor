@@ -384,6 +384,65 @@ describe("staged streaming job uploads", () => {
     await cleanStage(stage);
   });
 
+  it("commits a complete stage and repeats the started 202 idempotently", async () => {
+    const pdf = validPdf("successful-start");
+    const owner = "successful-start-owner@example.test";
+    const stage = await createStage(
+      [{ index: 0, filename: "complete.pdf", size: pdf.byteLength }],
+      { owner }
+    );
+
+    expect(
+      (await putStageFile(stage, 0, pdf, { owner })).status
+    ).toBe(204);
+
+    const stub = coordinatorNamespace.get(
+      coordinatorNamespace.idFromName(stage.jobId)
+    );
+    await runInDurableObject(stub, (_instance, state) => {
+      state.storage.sql.exec(
+        `INSERT INTO jobs
+           (id, status, created_at, total_pdfs, completed_pdfs,
+            failed_pdfs, config_json)
+         VALUES (?, 'complete', ?, 0, 0, 0, ?)`,
+        stage.jobId,
+        Date.now(),
+        JSON.stringify({
+          brands: "TREMFYA",
+          runs: 1,
+          explain: false,
+          pdfs: [],
+          owner,
+        })
+      );
+    });
+
+    const startUrl =
+      `https://example.com/api/jobs/stage/${stage.uploadId}/start`;
+    const first = await SELF.fetch(startUrl, {
+      method: "POST",
+      headers: { [OWNER_HEADER]: owner },
+    });
+    expect(first.status).toBe(202);
+    expect(await first.json()).toEqual({ jobId: stage.jobId });
+
+    const markerObject = await bucket.get(
+      `staging/${stage.uploadId}.json`
+    );
+    expect(markerObject).not.toBeNull();
+    const marker = await markerObject!.json<TestStageMarker>();
+    expect(marker.state).toBe("started");
+
+    const repeated = await SELF.fetch(startUrl, {
+      method: "POST",
+      headers: { [OWNER_HEADER]: owner },
+    });
+    expect(repeated.status).toBe(202);
+    expect(await repeated.json()).toEqual({ jobId: stage.jobId });
+
+    await cleanStage(stage);
+  });
+
   it("makes owner mismatch and unknown upload IDs indistinguishable", async () => {
     const owner = "real-owner@example.test";
     const stage = await createStage(

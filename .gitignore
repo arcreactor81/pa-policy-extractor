@@ -31,3 +31,7 @@ pdfs/
 benchmark_report.md
 
 .claude/
+
+# joint-review working artifacts
+*.tmp.md
+

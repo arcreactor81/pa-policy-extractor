@@ -8,6 +8,14 @@ function createBatchState() {
   };
 }
 
+function shouldRenderFinishedSnapshot(jobState) {
+  return !!(
+    jobState &&
+    typeof jobState === "object" &&
+    jobState.status === "complete"
+  );
+}
+
 function pdfIndexOf(event) {
   return event && typeof event.pdf_index === "number"
     ? event.pdf_index
@@ -173,8 +181,13 @@ function applyBatchEvent(current, event) {
 var batchStateApi = Object.freeze({
   createBatchState: createBatchState,
   applyBatchEvent: applyBatchEvent,
+  shouldRenderFinishedSnapshot: shouldRenderFinishedSnapshot,
 });
 
 globalThis.PABatchState = batchStateApi;
 
-export { applyBatchEvent, createBatchState };
+export {
+  applyBatchEvent,
+  createBatchState,
+  shouldRenderFinishedSnapshot,
+};

@@ -1478,7 +1478,7 @@
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (state) {
         if (state) applyJobMeta(Object.assign({ event: "job_state" }, state));
-        if (state && (state.status === "complete" || state.status === "done")) {
+        if (BatchState.shouldRenderFinishedSnapshot(state)) {
           loadFinishedResults(job.id);
         } else if (job && !job.done) {
           job.reconnectTimer = setTimeout(pollOnce, 4000);
@@ -1570,7 +1570,7 @@
     setStatusText("Loading saved job…");
     loadJobState(id).then(function (state) {
       if (!job || job.id !== id) return;
-      if (state && (state.status === "complete" || state.status === "done")) {
+      if (BatchState.shouldRenderFinishedSnapshot(state)) {
         loadFinishedResults(id).then(function (rendered) {
           if (!rendered && job && job.id === id) {
             startJob(id, { fresh: false });

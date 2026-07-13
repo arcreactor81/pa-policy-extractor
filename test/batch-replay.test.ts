@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   applyBatchEvent,
   createBatchState,
+  shouldRenderFinishedSnapshot,
 } from "../public/batch-state.js";
 import type {
   BatchEvent,
@@ -144,5 +145,22 @@ describe("batch replay reducer", () => {
     });
     expect(reconnectAfterStale.completedPdfs).toBe(1);
     expect(reconnectAfterStale.failedPdfs).toBe(1);
+  });
+
+  it("renders saved results only for the coordinator's complete state", () => {
+    expect(shouldRenderFinishedSnapshot({ status: "complete" })).toBe(true);
+
+    [
+      { status: "running" },
+      { status: "pending" },
+      { status: "failed" },
+      { status: "done" },
+      { status: "" },
+      {},
+      null,
+      undefined,
+    ].forEach((state) => {
+      expect(shouldRenderFinishedSnapshot(state)).toBe(false);
+    });
   });
 });

@@ -351,8 +351,8 @@ def test_permanent_failure_short_circuits_into_sanitized_paths(
     assert len(secondary_calls) == 1
 
 
-def test_permanent_scoring_failure_uses_boundary_fallback(
-        core_mod, monkeypatch):
+def test_permanent_scoring_failure_logs_detail_and_uses_sanitized_boundary_fallback(
+        core_mod, monkeypatch, caplog):
     calls = []
 
     def _chat(*args, **kwargs):
@@ -360,14 +360,19 @@ def test_permanent_scoring_failure_uses_boundary_fallback(
         raise llm.PermanentLLMError("permanent")
 
     monkeypatch.setattr(core_mod.llm, "chat", _chat)
+    caplog.set_level(logging.ERROR, logger="pa-extractor.core")
 
     score, justification = core_mod._access_score(
         _minimal_score_row(), "policy", brand="TREMFYA"
     )
 
     assert score == 0
-    assert justification == (
-        "(model scoring failed: permanent; boundary default applied)"
+    assert justification == "(model scoring failed; boundary default applied)"
+    assert "permanent" not in justification
+    assert any(
+        "access scoring failed for brand TREMFYA: permanent"
+        in record.getMessage()
+        for record in caplog.records
     )
     assert len(calls) == 1
 

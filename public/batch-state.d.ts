@@ -46,3 +46,5 @@ export function applyBatchEvent(
   current: BatchState | null | undefined,
   event: BatchEvent
 ): BatchState;
+
+export function shouldRenderFinishedSnapshot(jobState: unknown): boolean;
