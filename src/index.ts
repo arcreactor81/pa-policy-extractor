@@ -277,6 +277,13 @@ function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers });
 }
 
+/** Empty response carrying the shared security headers. */
+function empty(status = 204): Response {
+  const headers = new Headers();
+  applySecurityHeaders(headers);
+  return new Response(null, { status, headers });
+}
+
 /**
  * Proxy a request to the container at `path`. The original request is streamed
  * through unchanged (method + headers + body) by re-pointing its URL at the
@@ -348,6 +355,961 @@ async function enforceRateLimit(
 /** Set of valid brand names (uppercase) for validating the job `brands` csv. */
 const BRAND_SET: ReadonlySet<string> = new Set(BRANDS);
 
+/** Maximum JSON bytes accepted by POST /api/jobs/stage. */
+const MAX_STAGE_JSON_BYTES = 64 * 1024;
+
+/** Staging markers expire 48 hours after their latest successful upload. */
+const STAGING_TTL_MS = 48 * 60 * 60 * 1000;
+
+/** R2 prefix for staged-upload ownership and lifecycle markers. */
+const STAGING_PREFIX = "staging/";
+
+/** Strict base-10 byte-count syntax used for staged Content-Length headers. */
+const DECIMAL_BYTES = /^[0-9]+$/;
+
+/** The five bytes every staged PDF must begin with. */
+const PDF_MAGIC = new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d]);
+
+interface JobStageConfig {
+  brands: string;
+  runs: number;
+  explain: boolean;
+  consensus: boolean;
+}
+
+interface StageManifestEntry {
+  index: number;
+  filename: string;
+  size: number;
+}
+
+type StageMarkerState = "uploading" | "committing" | "started";
+
+interface StageMarker {
+  owner: string;
+  config: JobStageConfig;
+  manifest: StageManifestEntry[];
+  state: StageMarkerState;
+  updated_at: number;
+  expires: number;
+}
+
+interface LoadedStageMarker {
+  marker: StageMarker;
+  object: R2Object;
+}
+
+interface StreamLimitState {
+  limit: number;
+  bytes: number;
+  exceeded: boolean;
+}
+
+class BodyTooLargeError extends Error {
+  constructor() {
+    super("request body exceeded its byte limit");
+    this.name = "BodyTooLargeError";
+  }
+}
+
+class PdfMagicError extends Error {
+  constructor() {
+    super("staged upload is not a PDF");
+    this.name = "PdfMagicError";
+  }
+}
+
+class PdfLengthError extends Error {
+  constructor() {
+    super("staged upload body length did not match Content-Length");
+    this.name = "PdfLengthError";
+  }
+}
+
+/** True for a non-null JSON object that is not an array. */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Resolve the configured batch PDF count cap, defaulting to 25. */
+function maxPdfsPerJob(env: Env): number {
+  const raw = Number(env.MAX_PDFS_PER_JOB ?? "");
+  return Number.isFinite(raw) && raw > 0 ? Math.trunc(raw) : 25;
+}
+
+/** Resolve the legacy multipart body cap without changing its existing size. */
+function jobUploadCap(env: Env): number {
+  return Math.min(
+    maxPdfsPerJob(env) * MAX_UPLOAD_BYTES + 1024 * 1024,
+    MAX_JOB_UPLOAD_BYTES
+  );
+}
+
+/** Consistent 413 response for the legacy multipart stream limiter. */
+function legacyJobTooLarge(bytes: string | number, cap: number): Response {
+  return json(
+    {
+      error: `payload too large (${bytes} bytes > the ${cap} byte job upload limit)`,
+    } satisfies ErrorResponse,
+    413
+  );
+}
+
+/**
+ * Wrap a request body in an actual-byte counting stream. The multipart parser
+ * consumes this wrapped request, so missing, malformed, or understated
+ * Content-Length values cannot bypass the legacy job cap.
+ */
+function limitRequestBody(
+  request: Request,
+  limit: number
+): { request: Request; state: StreamLimitState } {
+  const state: StreamLimitState = {
+    limit,
+    bytes: 0,
+    exceeded: false,
+  };
+  if (!request.body) {
+    return { request, state };
+  }
+
+  const counter = new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      state.bytes += chunk.byteLength;
+      if (state.bytes > state.limit) {
+        state.exceeded = true;
+        throw new BodyTooLargeError();
+      }
+      controller.enqueue(chunk);
+    },
+  });
+
+  return {
+    request: new Request(request, {
+      body: request.body.pipeThrough(counter),
+    }),
+    state,
+  };
+}
+
+/** Read and parse a JSON request while enforcing an actual 64 KiB byte cap. */
+async function readBoundedJson(
+  request: Request,
+  limit: number
+): Promise<unknown> {
+  const lengthHeader = request.headers.get("content-length");
+  if (lengthHeader && DECIMAL_BYTES.test(lengthHeader)) {
+    const declared = BigInt(lengthHeader);
+    if (declared > BigInt(limit)) {
+      throw new BodyTooLargeError();
+    }
+  }
+  if (!request.body) {
+    throw new SyntaxError("missing JSON body");
+  }
+
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+      total += next.value.byteLength;
+      if (total > limit) {
+        try {
+          await reader.cancel("request body exceeded its byte limit");
+        } catch {
+          // The size error below is authoritative.
+        }
+        throw new BodyTooLargeError();
+      }
+      chunks.push(next.value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return JSON.parse(new TextDecoder().decode(bytes)) as unknown;
+}
+
+/** Validate and normalize staged job config before any PDF can be uploaded. */
+function validateStageConfig(
+  env: Env,
+  raw: unknown
+):
+  | { config: JobStageConfig }
+  | { error: string; status: number } {
+  if (!isRecord(raw)) {
+    return { error: "config must be a JSON object", status: 400 };
+  }
+
+  const { csv: brands, error: brandError } = parseBrandsCsv(
+    typeof raw.brands === "string" ? raw.brands : "",
+    BRAND_SET
+  );
+  if (brandError) {
+    return { error: brandError, status: 400 };
+  }
+
+  let runs = 3;
+  if (raw.runs !== undefined) {
+    const parsed =
+      typeof raw.runs === "number" || typeof raw.runs === "string"
+        ? Number(raw.runs)
+        : NaN;
+    if (
+      !Number.isFinite(parsed) ||
+      !Number.isInteger(parsed) ||
+      parsed < 1 ||
+      parsed > 5
+    ) {
+      return { error: "runs must be an integer from 1 through 5", status: 400 };
+    }
+    runs = parsed;
+  }
+
+  const explain = parseExplain(raw.explain);
+  const consensus = parseExplain(raw.consensus);
+  const brandCount = brands.split(",").length;
+  const validators = consensus ? numValidators(env) : 0;
+  const callsPerPdf =
+    brandCount * (2 * runs + (explain ? 1 : 0) + validators * runs);
+  const budget = maxLlmCalls(env);
+  if (callsPerPdf > budget) {
+    return {
+      error: `too many LLM calls per PDF (${callsPerPdf} > ${budget}); reduce brands or runs`,
+      status: 400,
+    };
+  }
+
+  return {
+    config: {
+      brands,
+      runs,
+      explain,
+      consensus,
+    },
+  };
+}
+
+/** Validate a complete, contiguous staged manifest before creating its marker. */
+function validateStageManifest(
+  env: Env,
+  raw: unknown
+):
+  | { manifest: StageManifestEntry[] }
+  | { error: string; status: number } {
+  if (!Array.isArray(raw)) {
+    return { error: "manifest must be a JSON array", status: 400 };
+  }
+  if (raw.length === 0) {
+    return { error: "manifest must contain at least one PDF", status: 400 };
+  }
+
+  const maxPdfs = maxPdfsPerJob(env);
+  if (raw.length > maxPdfs) {
+    return {
+      error: `too many PDFs (${raw.length} > ${maxPdfs} per job)`,
+      status: 400,
+    };
+  }
+
+  const manifest: StageManifestEntry[] = [];
+  let totalDeclared = 0;
+  for (let i = 0; i < raw.length; i++) {
+    const item = raw[i];
+    if (!isRecord(item)) {
+      return {
+        error: `manifest entry ${i} must be a JSON object`,
+        status: 400,
+      };
+    }
+
+    if (
+      item.index !== undefined &&
+      (!Number.isInteger(item.index) || item.index !== i)
+    ) {
+      return {
+        error: `manifest indexes must be contiguous from 0; expected ${i}`,
+        status: 400,
+      };
+    }
+
+    if (
+      typeof item.filename !== "string" ||
+      item.filename.trim().length === 0
+    ) {
+      return {
+        error: `manifest entry ${i} has an invalid filename`,
+        status: 400,
+      };
+    }
+
+    if (
+      typeof item.size !== "number" ||
+      !Number.isSafeInteger(item.size) ||
+      item.size <= 0
+    ) {
+      return {
+        error: `manifest entry ${i} has an invalid declared size`,
+        status: 400,
+      };
+    }
+    if (item.size > MAX_UPLOAD_BYTES) {
+      return {
+        error: `PDF '${item.filename}' too large (${item.size} > ${MAX_UPLOAD_BYTES} bytes)`,
+        status: 413,
+      };
+    }
+
+    totalDeclared += item.size;
+    if (!Number.isSafeInteger(totalDeclared)) {
+      return { error: "manifest declared byte total is invalid", status: 400 };
+    }
+
+    manifest.push({
+      index: i,
+      filename: item.filename,
+      size: item.size,
+    });
+  }
+
+  const totalCap = maxPdfs * MAX_UPLOAD_BYTES;
+  if (totalDeclared > totalCap) {
+    return {
+      error: `manifest declares too many bytes (${totalDeclared} > ${totalCap})`,
+      status: 413,
+    };
+  }
+
+  return { manifest };
+}
+
+/** R2 key for one staged-upload marker. */
+function stageMarkerKey(uploadId: string): string {
+  return `${STAGING_PREFIX}${uploadId}.json`;
+}
+
+/** Existing final R2 layout for one job PDF. */
+function stagedPdfKey(uploadId: string, index: number): string {
+  return `pdfs/${uploadId}/${index}.pdf`;
+}
+
+/** Structural guard for persisted staging markers. */
+function isStageMarker(value: unknown): value is StageMarker {
+  if (!isRecord(value) || !isRecord(value.config)) return false;
+  if (
+    typeof value.owner !== "string" ||
+    !["uploading", "committing", "started"].includes(
+      String(value.state)
+    ) ||
+    typeof value.updated_at !== "number" ||
+    !Number.isFinite(value.updated_at) ||
+    typeof value.expires !== "number" ||
+    !Number.isFinite(value.expires) ||
+    typeof value.config.brands !== "string" ||
+    typeof value.config.runs !== "number" ||
+    typeof value.config.explain !== "boolean" ||
+    typeof value.config.consensus !== "boolean" ||
+    !Array.isArray(value.manifest)
+  ) {
+    return false;
+  }
+
+  return value.manifest.every(
+    (item, index) =>
+      isRecord(item) &&
+      item.index === index &&
+      typeof item.filename === "string" &&
+      typeof item.size === "number" &&
+      Number.isSafeInteger(item.size) &&
+      item.size > 0 &&
+      item.size <= MAX_UPLOAD_BYTES
+  );
+}
+
+/** Load and validate a staging marker, treating corrupt markers as absent. */
+async function loadStageMarker(
+  env: Env,
+  uploadId: string
+): Promise<LoadedStageMarker | null> {
+  const object = await env.RESULT_BUCKET.get(stageMarkerKey(uploadId));
+  if (!object) return null;
+
+  try {
+    const marker = await object.json<unknown>();
+    if (!isStageMarker(marker)) return null;
+    return { marker, object };
+  } catch {
+    return null;
+  }
+}
+
+/** Write a marker, optionally using its previous ETag as a compare-and-swap. */
+async function writeStageMarker(
+  env: Env,
+  uploadId: string,
+  marker: StageMarker,
+  etag?: string
+): Promise<R2Object | null> {
+  return env.RESULT_BUCKET.put(
+    stageMarkerKey(uploadId),
+    JSON.stringify(marker),
+    etag
+      ? {
+          httpMetadata: { contentType: "application/json" },
+          onlyIf: { etagMatches: etag },
+        }
+      : {
+          httpMetadata: { contentType: "application/json" },
+        }
+  );
+}
+
+/** Indistinguishable response for an unknown upload and an owner mismatch. */
+function stageNotFound(): Response {
+  return json(
+    { error: "staging upload not found" } satisfies ErrorResponse,
+    404
+  );
+}
+
+/** Resolve the owner and owner-check a staging marker. */
+async function accessStageMarker(
+  env: Env,
+  request: Request,
+  uploadId: string
+): Promise<
+  | { owner: string; loaded: LoadedStageMarker }
+  | { response: Response }
+> {
+  const ownerRes = await resolveOwner(env, request);
+  if ("unauthorized" in ownerRes) {
+    return {
+      response: json(
+        { error: `unauthorized: ${ownerRes.reason}` } satisfies ErrorResponse,
+        401
+      ),
+    };
+  }
+
+  const loaded = await loadStageMarker(env, uploadId);
+  if (!loaded || loaded.marker.owner !== ownerRes.owner) {
+    return { response: stageNotFound() };
+  }
+  return { owner: ownerRes.owner, loaded };
+}
+
+/**
+ * Extend an active marker after a successful PUT. ETag compare-and-swap keeps
+ * this update from reverting a concurrent start transition to "uploading".
+ */
+async function extendStageMarker(
+  env: Env,
+  uploadId: string,
+  owner: string
+): Promise<"extended" | "inactive" | "missing"> {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const loaded = await loadStageMarker(env, uploadId);
+    if (!loaded || loaded.marker.owner !== owner) return "missing";
+    if (loaded.marker.state !== "uploading") return "inactive";
+
+    const now = Date.now();
+    const next: StageMarker = {
+      ...loaded.marker,
+      updated_at: now,
+      expires: now + STAGING_TTL_MS,
+    };
+    const written = await writeStageMarker(
+      env,
+      uploadId,
+      next,
+      loaded.object.httpEtag
+    );
+    if (written) return "extended";
+  }
+  throw new Error("staging marker changed repeatedly; retry the upload");
+}
+
+/**
+ * A validation stream that checks the five PDF magic bytes without buffering
+ * the upload and independently checks the actual byte count. FixedLengthStream
+ * remains the authoritative known-length stream passed to R2.
+ */
+function createPdfValidationStream(
+  expectedLength: number
+): TransformStream<Uint8Array, Uint8Array> {
+  let bytes = 0;
+  let magicOffset = 0;
+
+  return new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      bytes += chunk.byteLength;
+      if (bytes > expectedLength) {
+        throw new PdfLengthError();
+      }
+
+      const magicBytes = Math.min(
+        PDF_MAGIC.byteLength - magicOffset,
+        chunk.byteLength
+      );
+      for (let i = 0; i < magicBytes; i++) {
+        if (chunk[i] !== PDF_MAGIC[magicOffset + i]) {
+          throw new PdfMagicError();
+        }
+      }
+      magicOffset += magicBytes;
+      controller.enqueue(chunk);
+    },
+    flush() {
+      if (bytes !== expectedLength) {
+        throw new PdfLengthError();
+      }
+      if (magicOffset < PDF_MAGIC.byteLength) {
+        throw new PdfMagicError();
+      }
+    },
+  });
+}
+
+/** Whether any rejected operation contains an error of the requested class. */
+function settledHasError(
+  settled: PromiseSettledResult<unknown>[],
+  errorType: typeof PdfMagicError | typeof PdfLengthError
+): boolean {
+  return settled.some(
+    (result) =>
+      result.status === "rejected" && result.reason instanceof errorType
+  );
+}
+
+/**
+ * Send the byte-identical start payload used by both legacy multipart and the
+ * staged flow to the job's existing JobCoordinator Durable Object.
+ */
+async function startJobCoordinator(
+  env: Env,
+  jobId: string,
+  owner: string,
+  config: JobStageConfig,
+  pdfs: { index: number; filename: string }[]
+): Promise<Response> {
+  const { brands, runs, explain, consensus } = config;
+  const id = env.JOB_COORDINATOR.idFromName(jobId);
+  const stub = env.JOB_COORDINATOR.get(id);
+  return stub.fetch("https://jc/start", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      jobId,
+      owner,
+      brands,
+      runs,
+      explain,
+      consensus,
+      pdfs,
+    }),
+  });
+}
+
+/** POST /api/jobs/stage: validate config and manifest, then mint a marker. */
+async function handleCreateStage(
+  env: Env,
+  request: Request
+): Promise<Response> {
+  const limited = await enforceRateLimit(env, request);
+  if (limited) return limited;
+
+  const ownerRes = await resolveOwner(env, request);
+  if ("unauthorized" in ownerRes) {
+    return json(
+      { error: `unauthorized: ${ownerRes.reason}` } satisfies ErrorResponse,
+      401
+    );
+  }
+
+  let body: unknown;
+  try {
+    body = await readBoundedJson(request, MAX_STAGE_JSON_BYTES);
+  } catch (err) {
+    if (err instanceof BodyTooLargeError) {
+      return json(
+        {
+          error: `stage request JSON exceeds ${MAX_STAGE_JSON_BYTES} bytes`,
+        } satisfies ErrorResponse,
+        413
+      );
+    }
+    return json(
+      { error: "expected a valid JSON stage request" } satisfies ErrorResponse,
+      400
+    );
+  }
+
+  if (!isRecord(body)) {
+    return json(
+      { error: "stage request must be a JSON object" } satisfies ErrorResponse,
+      400
+    );
+  }
+
+  const configResult = validateStageConfig(env, body.config);
+  if ("error" in configResult) {
+    return json(
+      { error: configResult.error } satisfies ErrorResponse,
+      configResult.status
+    );
+  }
+
+  const manifestResult = validateStageManifest(env, body.manifest);
+  if ("error" in manifestResult) {
+    return json(
+      { error: manifestResult.error } satisfies ErrorResponse,
+      manifestResult.status
+    );
+  }
+
+  const uploadId = crypto.randomUUID();
+  const now = Date.now();
+  const marker: StageMarker = {
+    owner: ownerRes.owner,
+    config: configResult.config,
+    manifest: manifestResult.manifest,
+    state: "uploading",
+    updated_at: now,
+    expires: now + STAGING_TTL_MS,
+  };
+  await writeStageMarker(env, uploadId, marker);
+
+  return json(
+    {
+      uploadId,
+      jobId: uploadId,
+      uploads: marker.manifest.map((item) => ({
+        index: item.index,
+        url: `/api/jobs/stage/${uploadId}/files/${item.index}`,
+      })),
+      expires_at: marker.expires,
+    },
+    201
+  );
+}
+
+/**
+ * PUT one raw staged PDF into its final deterministic R2 key using a
+ * FixedLengthStream. The rate limiter is deliberately not used here because a
+ * legal 25-file batch would otherwise consume more than one heavy-request
+ * window.
+ */
+async function handlePutStageFile(
+  env: Env,
+  request: Request,
+  uploadId: string,
+  indexText: string
+): Promise<Response> {
+  if (!DECIMAL_BYTES.test(indexText)) return stageNotFound();
+  const index = Number(indexText);
+  if (!Number.isSafeInteger(index)) return stageNotFound();
+
+  const access = await accessStageMarker(env, request, uploadId);
+  if ("response" in access) return access.response;
+  const { owner, loaded } = access;
+
+  const entry = loaded.marker.manifest.find((item) => item.index === index);
+  if (!entry) return stageNotFound();
+  if (loaded.marker.state !== "uploading") {
+    return json(
+      { error: "staging upload is no longer accepting files" } satisfies ErrorResponse,
+      409
+    );
+  }
+
+  const lengthHeader = request.headers.get("content-length");
+  if (lengthHeader === null) {
+    return json(
+      { error: "Content-Length is required for staged PDF uploads" } satisfies ErrorResponse,
+      411
+    );
+  }
+  if (!DECIMAL_BYTES.test(lengthHeader)) {
+    return json(
+      { error: "Content-Length must be a decimal byte count" } satisfies ErrorResponse,
+      400
+    );
+  }
+
+  const contentLength = BigInt(lengthHeader);
+  if (contentLength > BigInt(MAX_UPLOAD_BYTES)) {
+    return json(
+      {
+        error: `PDF upload too large (${lengthHeader} > ${MAX_UPLOAD_BYTES} bytes)`,
+      } satisfies ErrorResponse,
+      413
+    );
+  }
+  if (contentLength !== BigInt(entry.size)) {
+    return json(
+      {
+        error: `Content-Length does not match the manifest (${lengthHeader} != ${entry.size})`,
+      } satisfies ErrorResponse,
+      409
+    );
+  }
+  if (!request.body) {
+    return json(
+      { error: "staged PDF request body is missing" } satisfies ErrorResponse,
+      400
+    );
+  }
+
+  const key = stagedPdfKey(uploadId, index);
+  const previous = await env.RESULT_BUCKET.head(key);
+  const fixed = new FixedLengthStream(entry.size);
+  const pumpPromise = request.body
+    .pipeThrough(createPdfValidationStream(entry.size))
+    .pipeTo(fixed.writable);
+  const putPromise = env.RESULT_BUCKET.put(key, fixed.readable, {
+    httpMetadata: { contentType: "application/pdf" },
+  });
+  const settled = await Promise.allSettled([pumpPromise, putPromise]);
+
+  if (settled.some((result) => result.status === "rejected")) {
+    // Streaming R2 puts are atomic. The delete additionally guarantees that a
+    // failed first upload cannot leave a key, while preserving a prior good
+    // object when an invalid re-PUT is attempted.
+    if (!previous) {
+      await env.RESULT_BUCKET.delete(key);
+    }
+    if (settledHasError(settled, PdfMagicError)) {
+      return json(
+        { error: `file '${entry.filename}' is not a PDF` } satisfies ErrorResponse,
+        415
+      );
+    }
+    if (settledHasError(settled, PdfLengthError)) {
+      return json(
+        {
+          error: "uploaded body length did not match Content-Length",
+        } satisfies ErrorResponse,
+        400
+      );
+    }
+    return json(
+      { error: "failed to stage PDF upload" } satisfies ErrorResponse,
+      502
+    );
+  }
+
+  const refresh = await extendStageMarker(env, uploadId, owner);
+  if (refresh === "missing") {
+    await env.RESULT_BUCKET.delete(key);
+    return stageNotFound();
+  }
+
+  return empty();
+}
+
+/** Return the manifest indexes whose final R2 objects are absent or wrong-size. */
+async function missingStageIndexes(
+  env: Env,
+  uploadId: string,
+  manifest: StageManifestEntry[]
+): Promise<number[]> {
+  const heads = await Promise.all(
+    manifest.map((item) =>
+      env.RESULT_BUCKET.head(stagedPdfKey(uploadId, item.index))
+    )
+  );
+  const missing: number[] = [];
+  for (let i = 0; i < manifest.length; i++) {
+    if (!heads[i] || heads[i]!.size !== manifest[i].size) {
+      missing.push(manifest[i].index);
+    }
+  }
+  return missing;
+}
+
+/** Persist the started tombstone after the idempotent DO start succeeds. */
+async function persistStartedStage(
+  env: Env,
+  uploadId: string,
+  owner: string,
+  fallback: StageMarker
+): Promise<void> {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const loaded = await loadStageMarker(env, uploadId);
+    if (loaded && loaded.marker.owner !== owner) {
+      throw new Error("staging marker owner changed");
+    }
+    if (loaded?.marker.state === "started") return;
+
+    const source = loaded?.marker ?? fallback;
+    const now = Date.now();
+    const started: StageMarker = {
+      ...source,
+      state: "started",
+      updated_at: now,
+      expires: now + STAGING_TTL_MS,
+    };
+    const written = await writeStageMarker(
+      env,
+      uploadId,
+      started,
+      loaded?.object.httpEtag
+    );
+    if (written) return;
+  }
+  throw new Error("could not persist staging start tombstone");
+}
+
+/** POST /api/jobs/stage/:uploadId/start: verify uploads and start the DO. */
+async function handleStartStage(
+  env: Env,
+  request: Request,
+  uploadId: string
+): Promise<Response> {
+  const access = await accessStageMarker(env, request, uploadId);
+  if ("response" in access) return access.response;
+  const { owner } = access;
+  let loaded = access.loaded;
+
+  if (loaded.marker.state === "started") {
+    return json({ jobId: uploadId }, 202);
+  }
+
+  if (loaded.marker.state === "uploading") {
+    const missing = await missingStageIndexes(
+      env,
+      uploadId,
+      loaded.marker.manifest
+    );
+    if (missing.length > 0) {
+      return json(
+        {
+          error: "not all staged PDFs have been uploaded",
+          missing,
+        },
+        409
+      );
+    }
+
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const now = Date.now();
+      const committing: StageMarker = {
+        ...loaded.marker,
+        state: "committing",
+        updated_at: now,
+        expires: now + STAGING_TTL_MS,
+      };
+      const written = await writeStageMarker(
+        env,
+        uploadId,
+        committing,
+        loaded.object.httpEtag
+      );
+      if (written) {
+        loaded = { marker: committing, object: written };
+        break;
+      }
+
+      const reloaded = await loadStageMarker(env, uploadId);
+      if (!reloaded || reloaded.marker.owner !== owner) {
+        return stageNotFound();
+      }
+      loaded = reloaded;
+      if (loaded.marker.state !== "uploading") break;
+    }
+  }
+
+  if (loaded.marker.state === "started") {
+    return json({ jobId: uploadId }, 202);
+  }
+  if (loaded.marker.state !== "committing") {
+    return json(
+      { error: "staging marker changed; retry start" } satisfies ErrorResponse,
+      409
+    );
+  }
+
+  const pdfs = loaded.marker.manifest.map((item) => ({
+    index: item.index,
+    filename: item.filename,
+  }));
+  const startRes = await startJobCoordinator(
+    env,
+    uploadId,
+    owner,
+    loaded.marker.config,
+    pdfs
+  );
+  if (!startRes.ok) {
+    return json(
+      { error: "failed to start job coordinator" } satisfies ErrorResponse,
+      502
+    );
+  }
+
+  await persistStartedStage(
+    env,
+    uploadId,
+    owner,
+    loaded.marker
+  );
+  return json({ jobId: uploadId }, 202);
+}
+
+/** Dispatch all staging routes before the generic /api/jobs/:id handler. */
+async function handleStageRoute(
+  env: Env,
+  request: Request,
+  pathname: string
+): Promise<Response> {
+  if (pathname === "/api/jobs/stage") {
+    if (request.method !== "POST") {
+      return json(
+        { error: "method not allowed; use POST" } satisfies ErrorResponse,
+        405
+      );
+    }
+    return handleCreateStage(env, request);
+  }
+
+  const fileMatch = pathname.match(
+    /^\/api\/jobs\/stage\/([^/]+)\/files\/([^/]+)$/
+  );
+  if (fileMatch) {
+    if (request.method !== "PUT") {
+      return json(
+        { error: "method not allowed; use PUT" } satisfies ErrorResponse,
+        405
+      );
+    }
+    return handlePutStageFile(env, request, fileMatch[1], fileMatch[2]);
+  }
+
+  const startMatch = pathname.match(
+    /^\/api\/jobs\/stage\/([^/]+)\/start$/
+  );
+  if (startMatch) {
+    if (request.method !== "POST") {
+      return json(
+        { error: "method not allowed; use POST" } satisfies ErrorResponse,
+        405
+      );
+    }
+    return handleStartStage(env, request, startMatch[1]);
+  }
+
+  return stageNotFound();
+}
+
 /**
  * POST /api/jobs — accept a multipart batch (1..MAX_PDFS_PER_JOB files +
  * brands + runs + explain + consensus), stage each PDF in R2
@@ -355,7 +1317,11 @@ const BRAND_SET: ReadonlySet<string> = new Set(BRANDS);
  * {jobId}. Caps enforced: per-file size, file count, total body size, and the
  * per-PDF LLM budget.
  */
-async function handleCreateJob(env: Env, request: Request): Promise<Response> {
+async function handleCreateJob(
+  env: Env,
+  request: Request,
+  streamLimit?: StreamLimitState
+): Promise<Response> {
   // Rate limit (per client IP) BEFORE doing any work.
   const limited = await enforceRateLimit(env, request);
   if (limited) return limited;
@@ -376,6 +1342,9 @@ async function handleCreateJob(env: Env, request: Request): Promise<Response> {
   try {
     form = await request.formData();
   } catch {
+    if (streamLimit?.exceeded) {
+      return legacyJobTooLarge(streamLimit.bytes, streamLimit.limit);
+    }
     return json({ error: "expected multipart/form-data body" } satisfies ErrorResponse, 400);
   }
 
@@ -468,13 +1437,13 @@ async function handleCreateJob(env: Env, request: Request): Promise<Response> {
   // persist each per-brand result to the owner's library on finalize (server-
   // side, so batch results survive a client disconnect). `owner` was resolved up
   // front (and the request 401'd already if Access-JWT mode rejected it).
-  const id = env.JOB_COORDINATOR.idFromName(jobId);
-  const stub = env.JOB_COORDINATOR.get(id);
-  const startRes = await stub.fetch("https://jc/start", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ jobId, owner, brands, runs, explain, consensus, pdfs }),
-  });
+  const startRes = await startJobCoordinator(
+    env,
+    jobId,
+    owner,
+    { brands, runs, explain, consensus },
+    pdfs
+  );
   if (!startRes.ok) {
     return json(
       { error: "failed to start job coordinator" } satisfies ErrorResponse,
@@ -539,7 +1508,7 @@ async function handleGetResults(env: Env, url: URL): Promise<Response> {
   return new Response(obj.body, { status: 200, headers });
 }
 
-// ─── W5: saved cohorts (/api/cohorts[...]) ────────────────────────────────────
+// ─── W5: saved cohorts (/api/cohorts[...]) ───────────────────────────────────
 //
 // All routes are OWNER-scoped (the cf-access identity) and ADDITIVE — they reuse
 // the SAME LIBRARY D1 + RESULT_BUCKET R2 (more tables, persistent cohort PDFs).
@@ -825,6 +1794,26 @@ export default {
       }
     }
 
+    // --- Layer 3: staged streaming batch upload routes ---------------------
+    // These must be matched before the generic /api/jobs/:id dispatcher.
+    if (
+      pathname === "/api/jobs/stage" ||
+      pathname.startsWith("/api/jobs/stage/")
+    ) {
+      try {
+        return await handleStageRoute(env, request, pathname);
+      } catch (err) {
+        return json(
+          {
+            error:
+              "staging request failed: " +
+              (err instanceof Error ? err.message : String(err)),
+          } satisfies ErrorResponse,
+          500
+        );
+      }
+    }
+
     // --- Layer 3: /api/jobs (create batch job) -----------------------------
     if (pathname === "/api/jobs") {
       if (request.method !== "POST") {
@@ -833,30 +1822,29 @@ export default {
           405
         );
       }
-      // Guard oversized bodies before reading the multipart form.
-      const lenHeader = request.headers.get("content-length");
-      if (lenHeader) {
-        const len = Number(lenHeader);
-        // Allow up to MAX_PDFS_PER_JOB * per-file cap (+ multipart overhead),
-        // but never beyond MAX_JOB_UPLOAD_BYTES — formData() buffers the whole
-        // body in memory and the isolate's 128MB limit is the real ceiling.
-        const maxPdfs = Number(env.MAX_PDFS_PER_JOB ?? "25") || 25;
-        const cap = Math.min(
-          maxPdfs * MAX_UPLOAD_BYTES + 1024 * 1024,
-          MAX_JOB_UPLOAD_BYTES
-        );
-        if (Number.isFinite(len) && len > cap) {
-          return json(
-            {
-              error: `payload too large (${len} bytes > the ${cap} byte job upload limit)`,
-            } satisfies ErrorResponse,
-            413
-          );
+
+      const cap = jobUploadCap(env);
+      const lengthHeader = request.headers.get("content-length");
+      if (lengthHeader && DECIMAL_BYTES.test(lengthHeader)) {
+        if (BigInt(lengthHeader) > BigInt(cap)) {
+          return legacyJobTooLarge(lengthHeader, cap);
         }
       }
+
+      const limitedRequest = limitRequestBody(request, cap);
       try {
-        return await handleCreateJob(env, request);
+        return await handleCreateJob(
+          env,
+          limitedRequest.request,
+          limitedRequest.state
+        );
       } catch (err) {
+        if (limitedRequest.state.exceeded) {
+          return legacyJobTooLarge(
+            limitedRequest.state.bytes,
+            limitedRequest.state.limit
+          );
+        }
         return json(
           {
             error:
@@ -1218,6 +2206,10 @@ export default {
    * results/lib/<id>.json objects, bounded per run so a large backlog drains over
    * several days. The sweep is owner-AGNOSTIC, safe, and idempotent. It runs even
    * when no cohort is opted in (the cohort sweep stays inert in that case).
+   *
+   * Expired staged-upload markers are swept in parallel. Uploading sessions
+   * delete their deterministic PDF keys; committing sessions probe the DO before
+   * deciding ownership; started tombstones delete only the marker.
    */
   async scheduled(
     _event: ScheduledController,
@@ -1226,6 +2218,7 @@ export default {
   ): Promise<void> {
     ctx.waitUntil(runScheduledCohorts(env));
     ctx.waitUntil(pruneLibrary(env));
+    ctx.waitUntil(sweepAbandonedStages(env));
   },
 };
 
@@ -1259,6 +2252,81 @@ async function runScheduledCohorts(env: Env): Promise<void> {
     } catch (err) {
       console.error(`scheduled run for cohort ${c.id} threw:`, err);
     }
+  }
+}
+
+/** Delete all deterministic PDF keys declared by one staging marker. */
+async function deleteStagePdfs(
+  env: Env,
+  uploadId: string,
+  manifest: StageManifestEntry[]
+): Promise<void> {
+  if (manifest.length === 0) return;
+  await env.RESULT_BUCKET.delete(
+    manifest.map((item) => stagedPdfKey(uploadId, item.index))
+  );
+}
+
+/**
+ * Sweep expired staging markers. An uploading marker still owns its PDFs and
+ * deletes them. A started marker is only a retry tombstone. A committing marker
+ * probes the DO: 404 means start never committed and the PDFs are abandoned;
+ * any non-404 response means the DO may own them, so only the marker is removed.
+ */
+async function sweepAbandonedStages(env: Env): Promise<void> {
+  try {
+    let cursor: string | undefined;
+    do {
+      const page = await env.RESULT_BUCKET.list({
+        prefix: STAGING_PREFIX,
+        cursor,
+        limit: 1000,
+      });
+
+      for (const listed of page.objects) {
+        try {
+          const uploadId = listed.key
+            .slice(STAGING_PREFIX.length)
+            .replace(/\.json$/, "");
+          if (!uploadId || listed.key !== stageMarkerKey(uploadId)) continue;
+
+          const loaded = await loadStageMarker(env, uploadId);
+          if (!loaded || loaded.marker.expires > Date.now()) continue;
+
+          if (loaded.marker.state === "started") {
+            await env.RESULT_BUCKET.delete(stageMarkerKey(uploadId));
+            continue;
+          }
+
+          if (loaded.marker.state === "uploading") {
+            await deleteStagePdfs(env, uploadId, loaded.marker.manifest);
+            await env.RESULT_BUCKET.delete(stageMarkerKey(uploadId));
+            continue;
+          }
+
+          try {
+            const id = env.JOB_COORDINATOR.idFromName(uploadId);
+            const stub = env.JOB_COORDINATOR.get(id);
+            const state = await stub.fetch("https://jc/state");
+            if (state.status === 404) {
+              await deleteStagePdfs(env, uploadId, loaded.marker.manifest);
+            }
+            await env.RESULT_BUCKET.delete(stageMarkerKey(uploadId));
+          } catch {
+            // Ambiguous committing state stays intact for the next sweep.
+          }
+        } catch (err) {
+          console.error(
+            `staging sweep failed for ${listed.key} (ignored):`,
+            err
+          );
+        }
+      }
+
+      cursor = page.truncated ? page.cursor : undefined;
+    } while (cursor);
+  } catch (err) {
+    console.error("staging sweep failed (ignored):", err);
   }
 }
 

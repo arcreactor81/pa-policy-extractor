@@ -37,8 +37,10 @@ MAX_BYTES = int(os.environ.get("MAX_PDF_BYTES", str(20 * 1024 * 1024)))  # 20 MB
 _MULTIPART_OVERHEAD = 1 * 1024 * 1024  # 1 MB
 app.config["MAX_CONTENT_LENGTH"] = MAX_BYTES + _MULTIPART_OVERHEAD
 
-# Shared LLM-call budget (see SHARED CONTRACTS): reject a request up front when
+# Shared logical LLM-call budget (see SHARED CONTRACTS): reject up front when
 # the per-brand call estimate, summed over brands, would exceed this.
+# This estimate intentionally excludes physical HTTP attempts made by either
+# retry layer; those attempts are recorded by pipeline.llm's structured logs.
 #
 # Per-brand calls (the /extract + /analyze "consensus-on" formula):
 #     runs(extract) + runs(score) + (explain?1:0) + (consensus? num_validators*runs : 0)
@@ -61,7 +63,7 @@ MAX_LLM_CALLS = int(os.environ.get("MAX_LLM_CALLS", "200"))
 
 def _llm_call_count(num_brands: int, runs: int, explain_spans: bool,
                     num_validators: int = 0) -> int:
-    """Per-contract LLM-call estimate, summed over brands:
+    """Per-contract logical LLM-call estimate, summed over brands:
         runs(extract) + runs(score) + (explain?1:0) + (consensus? num_validators*runs : 0)
     i.e. brands * (2*runs + (1 if spans) + num_validators*runs). Consensus only
     adds calls when it is BOTH requested AND the secondary provider is configured;
@@ -227,8 +229,8 @@ def extract():
         }), 400
 
     try:
-        log.info("extract: %s | %s (%d bytes) runs=%d explain=%s consensus=%s",
-                 filename, brand, len(pdf_bytes), runs, explain_spans, consensus)
+        log.info("extract: %s | %s (%d bytes) runs=%d explain=%s consensus=%s calls=%d",
+                 filename, brand, len(pdf_bytes), runs, explain_spans, consensus, calls)
         out = core.extract_one(pdf_bytes, filename, brand,
                                runs=runs, explain_spans=explain_spans,
                                consensus=consensus)

@@ -56,10 +56,13 @@ W3 — optional secondary (consensus) validator provider(s):
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 
 import requests
+
+log = logging.getLogger("pa-extractor.llm")
 
 MODEL_ID = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro").strip()
 # 900s: window-packed inputs on big documents run multi-minute prefill on the
@@ -87,6 +90,61 @@ _SECONDARY_TIMEOUT = float(os.environ.get("SECONDARY_TIMEOUT", "300"))
 # extraction JSON, and the truncated output would parse as a half-empty row.
 # DeepSeek's default is generous, but sending the field is harmless there.
 LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "4096"))
+
+
+class LLMError(RuntimeError):
+    """Base class for classified LLM failures."""
+
+    def __init__(self, message: str, *, outcome: str | None = None,
+                 status: int | None = None) -> None:
+        super().__init__(message)
+        self.outcome = outcome
+        self.status = status
+
+
+class PermanentLLMError(LLMError):
+    """A failure that must not be retried at either retry layer."""
+
+
+class TransientLLMError(LLMError):
+    """A retryable transport, HTTP, or truncation failure."""
+
+
+class InvalidLLMResponseError(LLMError):
+    """A successful HTTP response whose completion payload is unusable."""
+
+
+# Deliberate four-class transport whitelist. Everything else escapes _chat()
+# immediately instead of being silently converted into an inner retry.
+_RETRYABLE_TRANSPORT_ERRORS = (
+    requests.exceptions.Timeout,
+    requests.exceptions.ConnectionError,
+    requests.exceptions.ChunkedEncodingError,
+    requests.exceptions.ContentDecodingError,
+)
+
+
+def _transport_outcome(error: BaseException) -> str:
+    """Map the retryable transport whitelist to a finite log outcome."""
+    if isinstance(error, requests.exceptions.Timeout):
+        return "timeout"
+    if isinstance(error, requests.exceptions.ChunkedEncodingError):
+        return "chunked_encoding_error"
+    if isinstance(error, requests.exceptions.ContentDecodingError):
+        return "content_decoding_error"
+    return "connection_error"
+
+
+def _log_attempt(*, provider: str, operation: str, outer_attempt: int,
+                 http_attempt: int, max_http_attempts: int, outcome: str,
+                 status: int | None = None) -> None:
+    """Emit one metadata-only record for a physical HTTP attempt."""
+    log.info(
+        "llm_attempt provider=%s operation=%s outer_attempt=%d "
+        "http_attempt=%d max_http_attempts=%d outcome=%s status=%s",
+        provider, operation, outer_attempt, http_attempt, max_http_attempts,
+        outcome, status if status is not None else "-",
+    )
 
 
 def _parse_validator_models() -> list:
@@ -135,7 +193,7 @@ def _base_url() -> str:
 def _headers(metadata: dict | None = None) -> dict:
     key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
     if not key:
-        raise RuntimeError("DEEPSEEK_API_KEY is not set.")
+        raise PermanentLLMError("DEEPSEEK_API_KEY is not set.")
     h = {
         "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
@@ -153,7 +211,8 @@ def _headers(metadata: dict | None = None) -> dict:
 def _chat(base_url: str, headers: dict, model: str, *,
           system_instruction: str, user_prompt: str,
           temperature: float, json_output: bool, max_retries: int,
-          timeout: float, thinking: bool, provider: str) -> str:
+          timeout: float, thinking: bool, provider: str,
+          operation: str = "chat", outer_attempt: int = 1) -> str:
     """Shared OpenAI-compatible chat-completion call (primary + validators).
 
     Holds the ONE copy of the request/retry/parse logic that chat() (DeepSeek
@@ -161,11 +220,11 @@ def _chat(base_url: str, headers: dict, model: str, *,
     only per-provider differences are passed in: `base_url`, `headers`, `model`,
     and `thinking` (DeepSeek-only reasoning effort — Workers AI rejects it).
 
-    Mirrors the retry semantics of the original `call_gemini`: transient errors
-    and non-stop finish reasons are retried; the final content string is returned
-    for the caller to JSON-parse with the notebooks' own parser. Raises on total
-    failure so the caller can record an error row / degrade gracefully. `provider`
-    is used only in the final error message.
+    Retries only the explicit transient whitelist: the four transport classes,
+    HTTP 408/429/5xx, and finish_reason=length. Permanent HTTP/config/blocking
+    failures and malformed success payloads escape immediately. Every physical
+    requests.post call emits one metadata-only attempt log; prompts, secrets,
+    request bodies, and response bodies are never logged.
     """
     url = f"{base_url}/chat/completions"
     body = {
@@ -197,36 +256,132 @@ def _chat(base_url: str, headers: dict, model: str, *,
 
     last_err = None
     for attempt in range(max_retries):
+        http_attempt = attempt + 1
         try:
             resp = requests.post(url, headers=headers, json=body, timeout=timeout)
-            if resp.status_code >= 400:
-                raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:500]}")
-            data = resp.json()
-            choices = data.get("choices") or []
-            if not choices:
-                raise ValueError(f"no choices returned: {str(data)[:300]}")
-            choice = choices[0]
-            finish = str(choice.get("finish_reason", "")).lower()
-            # `stop` = normal completion. `length` = truncated (retryable). Treat
-            # content-filter style stops as terminal failures.
-            if finish in ("content_filter", "safety"):
-                raise ValueError(f"blocked: finish_reason={finish}")
-            content = (choice.get("message") or {}).get("content")
-            if not content or not str(content).strip():
-                raise ValueError(f"empty content (finish_reason={finish})")
-            return str(content)
-        except Exception as e:  # noqa: BLE001
-            last_err = e
-            if attempt < max_retries - 1:
-                time.sleep(2 * (attempt + 1))
-            continue
+            status = int(resp.status_code)
+            if status == 408:
+                raise TransientLLMError(
+                    f"{provider} returned HTTP 408",
+                    outcome="http_408", status=status,
+                )
+            if status == 429:
+                raise TransientLLMError(
+                    f"{provider} returned HTTP 429",
+                    outcome="http_429", status=status,
+                )
+            if 500 <= status < 600:
+                raise TransientLLMError(
+                    f"{provider} returned HTTP {status}",
+                    outcome="http_5xx", status=status,
+                )
+            if 400 <= status < 500:
+                raise PermanentLLMError(
+                    f"{provider} returned HTTP {status}",
+                    outcome="http_4xx_permanent", status=status,
+                )
+            if status >= 600:
+                raise InvalidLLMResponseError(
+                    f"{provider} returned invalid HTTP status {status}",
+                    outcome="invalid_response", status=status,
+                )
 
-    raise RuntimeError(f"{provider} call failed after {max_retries} attempts: {last_err}")
+            try:
+                data = resp.json()
+            except ValueError as error:
+                raise InvalidLLMResponseError(
+                    f"{provider} returned invalid JSON",
+                    outcome="invalid_response", status=status,
+                ) from error
+            if not isinstance(data, dict):
+                raise InvalidLLMResponseError(
+                    f"{provider} returned a non-object completion",
+                    outcome="invalid_response", status=status,
+                )
+            choices = data.get("choices")
+            if not isinstance(choices, list) or not choices:
+                raise InvalidLLMResponseError(
+                    f"{provider} returned no choices",
+                    outcome="invalid_response", status=status,
+                )
+            choice = choices[0]
+            if not isinstance(choice, dict):
+                raise InvalidLLMResponseError(
+                    f"{provider} returned an invalid choice",
+                    outcome="invalid_response", status=status,
+                )
+
+            finish = str(choice.get("finish_reason", "")).lower()
+            if finish in ("content_filter", "safety"):
+                raise PermanentLLMError(
+                    f"{provider} blocked completion: finish_reason={finish}",
+                    outcome=finish, status=status,
+                )
+            if finish == "length":
+                raise TransientLLMError(
+                    f"{provider} truncated completion: finish_reason=length",
+                    outcome="length", status=status,
+                )
+
+            message = choice.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            if not content or not str(content).strip():
+                raise InvalidLLMResponseError(
+                    f"{provider} returned empty content",
+                    outcome="invalid_response", status=status,
+                )
+
+            _log_attempt(
+                provider=provider, operation=operation, outer_attempt=outer_attempt,
+                http_attempt=http_attempt, max_http_attempts=max_retries,
+                outcome="success", status=status,
+            )
+            return str(content)
+        except _RETRYABLE_TRANSPORT_ERRORS as error:
+            last_err = error
+            _log_attempt(
+                provider=provider, operation=operation, outer_attempt=outer_attempt,
+                http_attempt=http_attempt, max_http_attempts=max_retries,
+                outcome=_transport_outcome(error),
+            )
+        except TransientLLMError as error:
+            last_err = error
+            _log_attempt(
+                provider=provider, operation=operation, outer_attempt=outer_attempt,
+                http_attempt=http_attempt, max_http_attempts=max_retries,
+                outcome=error.outcome or "transient_error", status=error.status,
+            )
+        except (PermanentLLMError, InvalidLLMResponseError) as error:
+            _log_attempt(
+                provider=provider, operation=operation, outer_attempt=outer_attempt,
+                http_attempt=http_attempt, max_http_attempts=max_retries,
+                outcome=error.outcome or "invalid_response", status=error.status,
+            )
+            raise
+        except Exception:  # noqa: BLE001 - unclassified failures are not retried
+            _log_attempt(
+                provider=provider, operation=operation, outer_attempt=outer_attempt,
+                http_attempt=http_attempt, max_http_attempts=max_retries,
+                outcome="unexpected_error",
+            )
+            raise
+
+        if attempt < max_retries - 1:
+            time.sleep(2 * (attempt + 1))
+
+    error = TransientLLMError(
+        f"{provider} call failed after {max_retries} attempts",
+        outcome="transient_exhausted",
+    )
+    if last_err is None:
+        raise error
+    raise error from last_err
 
 
 def chat(system_instruction: str, user_prompt: str,
          temperature: float = 0.1, json_output: bool = True,
-         max_retries: int = 3, metadata: dict | None = None) -> str:
+         max_retries: int = 3, metadata: dict | None = None, *,
+         operation: str = "chat", outer_attempt: int = 1) -> str:
     """Run one chat completion against the PRIMARY (DeepSeek) provider.
 
     Thin wrapper over _chat() with the DeepSeek base URL/headers, the canonical
@@ -240,6 +395,7 @@ def chat(system_instruction: str, user_prompt: str,
         system_instruction=system_instruction, user_prompt=user_prompt,
         temperature=temperature, json_output=json_output, max_retries=max_retries,
         timeout=_TIMEOUT, thinking=thinking, provider="DeepSeek",
+        operation=operation, outer_attempt=outer_attempt,
     )
 
 
@@ -291,7 +447,7 @@ def secondary_enabled() -> bool:
 def _secondary_headers() -> dict:
     key = os.environ.get("CF_API_TOKEN", "").strip()
     if not key:
-        raise RuntimeError("CF_API_TOKEN is not set (secondary provider disabled).")
+        raise PermanentLLMError("CF_API_TOKEN is not set (secondary provider disabled).")
     h = {
         "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
@@ -307,7 +463,8 @@ def _secondary_headers() -> dict:
 
 def chat_secondary(system_instruction: str, user_prompt: str,
                    temperature: float = 0.1, json_output: bool = True,
-                   max_retries: int = 3, model: str | None = None) -> str:
+                   max_retries: int = 3, model: str | None = None, *,
+                   operation: str = "validator", outer_attempt: int = 1) -> str:
     """Run one chat completion against a SECONDARY validator (Workers AI).
 
     Thin wrapper over _chat() with the Workers AI base URL/headers and a single
@@ -323,12 +480,13 @@ def chat_secondary(system_instruction: str, user_prompt: str,
     """
     base = _secondary_base_url()
     if not base:
-        raise RuntimeError("secondary base URL is not configured.")
+        raise PermanentLLMError("secondary base URL is not configured.")
     return _chat(
         base, _secondary_headers(), (model or SECONDARY_MODEL),
         system_instruction=system_instruction, user_prompt=user_prompt,
         temperature=temperature, json_output=json_output, max_retries=max_retries,
         timeout=_SECONDARY_TIMEOUT, thinking=False, provider="secondary",
+        operation=operation, outer_attempt=outer_attempt,
     )
 
 

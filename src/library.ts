@@ -82,6 +82,12 @@ export type OwnerResult =
   | { owner: string }
   | { unauthorized: true; reason: string };
 
+/** Explicit idempotency mode used only by durable batch finalization. */
+export interface BatchLibraryIdempotency {
+  pdfIndex: number;
+  finalizedAt: number;
+}
+
 /** R2 key prefix for full library result JSON documents. */
 const LIB_PREFIX = "results/lib/";
 
@@ -192,6 +198,9 @@ export async function ensureLibrarySchema(db: D1Database): Promise<void> {
          ON analyses (owner, file_sha256, brand, runs, explain, created_at)`
     ),
   ]);
+
+  // No new uniqueness migration is needed or safe for deployed data. Durable
+  // batch idempotency uses the existing analyses.id primary key.
 }
 
 /** Read a display-column string off a ResultRow, defaulting to "". */
@@ -212,11 +221,45 @@ function accessScore(row: ResultRow | undefined): number | null {
   return Number.isFinite(n) ? Math.trunc(n) : null;
 }
 
+/** Hex-encode a digest for a deterministic library row id. */
+function digestHex(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let output = "";
+  for (const byte of bytes) {
+    output += byte.toString(16).padStart(2, "0");
+  }
+  return output;
+}
+
+/**
+ * Stable batch identity: SHA-256 of an unambiguous JSON tuple containing owner,
+ * job id, PDF index, and normalized brand.
+ */
+export async function deterministicBatchResultId(args: {
+  owner: string;
+  jobId: string;
+  pdfIndex: number;
+  brand: string;
+}): Promise<string> {
+  const normalizedBrand = args.brand.trim().toUpperCase();
+  const material = JSON.stringify([
+    args.owner,
+    args.jobId,
+    args.pdfIndex,
+    normalizedBrand,
+  ]);
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(material)
+  );
+  return digestHex(digest);
+}
+
 /**
  * Build the D1 INDEX/FACET row for one ExtractResult. Pulls the facet params off
  * `result.result` (a ResultRow keyed by the exact deliverable display columns)
- * and stamps in the owner/kind/cache fields. `id` is the uuid that is ALSO the
- * R2 object key (results/lib/<id>.json) via `result_key`.
+ * and stamps in the owner/kind/cache fields. `id` is also the R2 object key
+ * (results/lib/<id>.json) via `result_key`.
  */
 export function rowFromExtractResult(args: {
   id: string;
@@ -257,8 +300,36 @@ export function rowFromExtractResult(args: {
   };
 }
 
-/** Build the prepared INSERT statement for one library row (bound, unrun). */
-function insertStatement(db: D1Database, row: LibraryRow): D1PreparedStatement {
+/** Build one bound INSERT statement, optionally with batch-only owner upsert. */
+function insertStatement(
+  db: D1Database,
+  row: LibraryRow,
+  idempotentBatch = false
+): D1PreparedStatement {
+  const conflict = idempotentBatch
+    ? ` ON CONFLICT(id) DO UPDATE SET
+          created_at = excluded.created_at,
+          kind = excluded.kind,
+          job_id = excluded.job_id,
+          filename = excluded.filename,
+          file_sha256 = excluded.file_sha256,
+          brand = excluded.brand,
+          access_score = excluded.access_score,
+          age = excluded.age,
+          branded_steps = excluded.branded_steps,
+          generic_steps = excluded.generic_steps,
+          phototherapy = excluded.phototherapy,
+          tb = excluded.tb,
+          quantity_limits = excluded.quantity_limits,
+          specialist = excluded.specialist,
+          init_auth = excluded.init_auth,
+          reauth_required = excluded.reauth_required,
+          runs = excluded.runs,
+          explain = excluded.explain,
+          result_key = excluded.result_key
+        WHERE analyses.owner = excluded.owner`
+    : "";
+
   return db
     .prepare(
       `INSERT INTO analyses (
@@ -266,7 +337,8 @@ function insertStatement(db: D1Database, row: LibraryRow): D1PreparedStatement {
          access_score, age, branded_steps, generic_steps, phototherapy, tb,
          quantity_limits, specialist, init_auth, reauth_required, runs, explain,
          result_key
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ${conflict}`
     )
     .bind(
       row.id,
@@ -303,12 +375,9 @@ export async function insertLibraryRow(
 
 /**
  * Shared write path used by BOTH the POST /api/library Worker route and the
- * JobCoordinator DO's finalizeJob. For each ExtractResult: mint a uuid, write the
- * FULL object to R2 at results/lib/<id>.json, build the index row, then INSERT all
- * index rows to D1 (batched). Returns a compact descriptor of what was saved.
- *
- * Schema is ensured first so callers never have to remember to. R2 writes happen
- * before the D1 inserts so a row never points at a missing object.
+ * JobCoordinator DO's finalizeJob. Interactive saves mint random UUIDs. Durable
+ * batch finalization derives stable ids and a frozen created_at. For each result,
+ * write the full object to R2 first, then write all D1 index rows in one batch.
  */
 export async function persistResults(args: {
   db: D1Database;
@@ -320,15 +389,37 @@ export async function persistResults(args: {
   runs: number;
   explain: boolean;
   results: ExtractResult[];
+  batchIdempotency?: BatchLibraryIdempotency;
 }): Promise<LibrarySaveResponse> {
   await ensureLibrarySchema(args.db);
 
-  const createdAt = Date.now();
+  const idempotency = args.batchIdempotency;
+  if (
+    idempotency &&
+    (args.kind !== "batch" || !args.jobId)
+  ) {
+    throw new Error(
+      "batch idempotency requires kind=batch and a non-empty jobId"
+    );
+  }
+
+  const createdAt = idempotency?.finalizedAt ?? Date.now();
   const rows: LibraryRow[] = [];
 
   for (const result of args.results) {
     if (!result || typeof result !== "object") continue;
-    const id = crypto.randomUUID();
+    const normalizedBrand = col(result.result, "Brand")
+      .trim()
+      .toUpperCase();
+    const id = idempotency
+      ? await deterministicBatchResultId({
+          owner: args.owner,
+          jobId: args.jobId as string,
+          pdfIndex: idempotency.pdfIndex,
+          brand: normalizedBrand,
+        })
+      : crypto.randomUUID();
+
     const row = rowFromExtractResult({
       id,
       createdAt,
@@ -349,7 +440,19 @@ export async function persistResults(args: {
   }
 
   if (rows.length > 0) {
-    await args.db.batch(rows.map((row) => insertStatement(args.db, row)));
+    const writes = await args.db.batch(
+      rows.map((row) =>
+        insertStatement(args.db, row, Boolean(idempotency))
+      )
+    );
+    if (
+      idempotency &&
+      writes.some((write) => write.meta.changes !== 1)
+    ) {
+      throw new Error(
+        "idempotent batch library write did not change exactly one row"
+      );
+    }
   }
 
   return {

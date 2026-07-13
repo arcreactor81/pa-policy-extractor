@@ -16,6 +16,7 @@
        (no FOUC). Loaded synchronously (no defer) so it runs before first paint.
        Externalized from an inline <script> for CSP script-src 'self'. -->
   <script src="/theme.js"></script>
+  <script type="module" src="/batch-state.js?v=20260713-fix3"></script>
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to content</a>
@@ -983,7 +984,7 @@
   </footer>
 
   <script src="/app.js" defer></script>
-  <script src="/batch.js" defer></script>
+  <script src="/batch.js?v=20260713-fix3" defer></script>
   <script src="/library.js" defer></script>
   <script src="/analytics.js" defer></script>
   <script src="/export.js" defer></script>

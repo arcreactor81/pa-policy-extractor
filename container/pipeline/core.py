@@ -475,12 +475,15 @@ def _extract_params(policy_text: str, brand: str) -> dict:
     )
 
     last_err = None
-    for _ in range(3):
+    for outer_attempt in range(1, 4):
         try:
             text = llm.chat(SYSTEM_PROMPT, user_prompt, temperature=0.1, json_output=True,
-                            metadata={"feature": "extract", "brand": brand})
+                            metadata={"feature": "extract", "brand": brand},
+                            operation="extract", outer_attempt=outer_attempt)
             params = parse_json_response(text)
             return validate_and_normalize(params, brand)
+        except llm.PermanentLLMError:
+            raise
         except Exception as e:  # noqa: BLE001
             last_err = e
             continue
@@ -512,12 +515,16 @@ def _extract_params_secondary(policy_text: str, brand: str, model: str = None) -
     )
 
     last_err = None
-    for _ in range(3):
+    for outer_attempt in range(1, 4):
         try:
             text = llm.chat_secondary(SYSTEM_PROMPT, user_prompt, temperature=0.1,
-                                      json_output=True, model=model)
+                                      json_output=True, model=model,
+                                      operation="validator_extract",
+                                      outer_attempt=outer_attempt)
             params = parse_json_response(text)
             return validate_and_normalize(params, brand)
+        except llm.PermanentLLMError:
+            raise
         except Exception as e:  # noqa: BLE001
             last_err = e
             continue
@@ -549,10 +556,11 @@ def _access_score(row: dict, policy_text: str, brand: str = "") -> tuple:
 
     score, justification = None, ""
     last_err = None
-    for _ in range(3):
+    for outer_attempt in range(1, 4):
         try:
             text = llm.chat(METHODOLOGY_PROMPT, user_prompt, temperature=0.1, json_output=True,
-                            metadata={"feature": "score", "brand": brand})
+                            metadata={"feature": "score", "brand": brand},
+                            operation="score", outer_attempt=outer_attempt)
             data = _parse_json(text)
             if data is None:
                 raise ValueError("access JSON parse failed")
@@ -562,6 +570,8 @@ def _access_score(row: dict, policy_text: str, brand: str = "") -> tuple:
             score = cand
             justification = str(data.get("justification", "")).strip()
             break
+        except llm.PermanentLLMError:
+            raise
         except Exception as e:  # noqa: BLE001
             last_err = e
             continue

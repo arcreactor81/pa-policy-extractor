@@ -10,8 +10,11 @@
    card has exactly one implementation.
 
    Job API consumed here (provided by the Worker + JobCoordinator DO):
-     POST /api/jobs              multipart: repeated "file" + brands(csv) + runs
-                                 + explain + consensus -> 202 { "jobId": "<uuid>" }
+     POST /api/jobs/stage      JSON config + manifest -> staged upload session
+     PUT  /api/jobs/stage/:id/files/:index
+                                 raw PDF body -> final deterministic R2 key
+     POST /api/jobs/stage/:id/start
+                                 verify uploads + start -> 202 { "jobId": "<uuid>" }
      GET  /api/jobs/:id          -> JSON job state (poll fallback)
      GET  /api/jobs/:id/stream?lastSeq=N   -> WebSocket upgrade (DO replays
                                  events with seq_num > N, then streams live)
@@ -26,7 +29,8 @@
   // The shared surface app.js exports. If it is somehow absent (app.js failed
   // to load), bail quietly — single mode keeps working, batch stays dormant.
   var PA = window.PA;
-  if (!PA) return;
+  var BatchState = window.PABatchState;
+  if (!PA || !BatchState) return;
 
   // ---- constants ----------------------------------------------------------
   var MAX_BYTES = PA.MAX_BYTES || 20 * 1024 * 1024;
@@ -34,6 +38,10 @@
   // client-side. Mirrors MAX_PDFS_PER_JOB.
   var MAX_PDFS_PER_JOB = 25;
   var DEEP_RUNS = PA.DEEP_RUNS || 3;
+
+  // Each individual PDF upload gets two retries after its initial attempt.
+  var UPLOAD_RETRIES = 2;
+  var UPLOAD_RETRY_BASE = 650;
 
   // localStorage keys.
   var JOBS_KEY = "pa_jobs_v1";                   // recent jobIds (small history)
@@ -135,6 +143,7 @@
       brandsPerPdf: null,
       // pdf_index -> { section, name, cardsHost, cards:{brand->card}, status, done, failed }
       pdfs: {},
+      eventState: BatchState.createBatchState(),
       // ordered list of { pdfIndex, filename, brand, data } result rows for aggregation
       results: [],
       cardSeq: 0
@@ -326,48 +335,184 @@
   }
 
   // =========================================================================
-  // submit -> POST /api/jobs
+  // staged batch submission
   // =========================================================================
+  function pause(ms) {
+    return new Promise(function (resolve) { setTimeout(resolve, ms); });
+  }
+
+  function retryableUploadStatus(status) {
+    return status === 408 || status === 429 || status >= 500;
+  }
+
+  function uploadRetryDelay(resp, retryNumber) {
+    if (resp && resp.status === 429) {
+      var seconds = Number(resp.headers.get("retry-after"));
+      if (Number.isFinite(seconds) && seconds > 0) {
+        return Math.min(10000, Math.round(seconds * 1000));
+      }
+    }
+    return Math.min(5000, UPLOAD_RETRY_BASE * Math.pow(2, retryNumber));
+  }
+
+  function responseError(resp, fallback) {
+    return resp.text().then(function (text) {
+      var data = null;
+      try { data = text ? JSON.parse(text) : null; } catch (e) { data = null; }
+      if (data && data.error) return String(data.error);
+      if (text) return text.slice(0, 200);
+      return fallback || ("Server returned HTTP " + resp.status);
+    });
+  }
+
+  function expectJsonResponse(resp, requiredKey) {
+    return resp.text().then(function (text) {
+      var data = null;
+      try { data = text ? JSON.parse(text) : null; } catch (e) { data = null; }
+      if (!resp.ok || !data || (requiredKey && !data[requiredKey])) {
+        var msg = (data && data.error) ||
+          ("Server returned HTTP " + resp.status + (text ? (": " + text.slice(0, 200)) : ""));
+        throw new Error(msg);
+      }
+      return data;
+    });
+  }
+
+  function uploadStageFile(upload, file, index, total) {
+    var retry = 0;
+
+    function attempt() {
+      var suffix = retry > 0
+        ? (" (retry " + retry + "/" + UPLOAD_RETRIES + ")")
+        : "";
+      batchSubmitLabel.textContent =
+        "Uploading " + (index + 1) + "/" + total + suffix;
+
+      // File/Blob request bodies have a known byte length, so the browser emits
+      // Content-Length itself. JavaScript must not try to set that forbidden
+      // request header manually.
+      return fetch(upload.url, {
+        method: "PUT",
+        headers: { "Content-Type": "application/pdf" },
+        body: file
+      }).then(function (resp) {
+        if (resp.ok) return null;
+
+        if (retryableUploadStatus(resp.status) && retry < UPLOAD_RETRIES) {
+          var delay = uploadRetryDelay(resp, retry);
+          retry++;
+          return pause(delay).then(attempt);
+        }
+
+        return responseError(resp, "HTTP " + resp.status).then(function (msg) {
+          throw new Error("Upload failed for '" + file.name + "': " + msg);
+        });
+      }, function (err) {
+        if (retry < UPLOAD_RETRIES) {
+          var delay = uploadRetryDelay(null, retry);
+          retry++;
+          return pause(delay).then(attempt);
+        }
+        var detail = err && err.message ? err.message : "network error";
+        throw new Error("Upload failed for '" + file.name + "': " + detail);
+      });
+    }
+
+    return attempt();
+  }
+
   function submitBatch() {
     if (submitting || mode !== "batch") return;
     var brands = selectedBrands();
     if (!batchFiles.length || !brands.length) return;
 
+    // Freeze the exact file order for the whole staged protocol. The UI remains
+    // disabled during submission, but this also protects against programmatic
+    // mutations while requests are in flight.
+    var files = batchFiles.slice();
+    var deep = !!(deepConfidenceToggle && deepConfidenceToggle.checked);
+    var quotes = !sourceQuotesToggle || sourceQuotesToggle.checked;
+    var consensus = !!(consensusToggle && consensusToggle.checked);
+
+    var config = {
+      brands: brands.join(","),
+      explain: quotes,
+      consensus: consensus
+    };
+    // Omitting runs preserves the legacy batch default. Deep Confidence sends
+    // the explicit configured run count.
+    if (deep) config.runs = DEEP_RUNS;
+
+    var manifest = files.map(function (file, index) {
+      return {
+        index: index,
+        filename: file.name,
+        size: file.size
+      };
+    });
+
     clearBatchError();
     submitting = true;
     batchSubmitBtn.classList.add("is-loading");
     refreshBatchSubmitEnabled();
+    batchSubmitLabel.textContent = "Preparing upload...";
 
-    var form = new FormData();
-    batchFiles.forEach(function (file) { form.append("file", file, file.name); });
-    form.append("brands", brands.join(","));
-    var deep = !!(deepConfidenceToggle && deepConfidenceToggle.checked);
-    var quotes = !sourceQuotesToggle || sourceQuotesToggle.checked;
-    var consensus = !!(consensusToggle && consensusToggle.checked);
-    if (deep) form.append("runs", String(DEEP_RUNS));
-    form.append("explain", quotes ? "true" : "false");
-    // W3 cross-check (toggle ships CHECKED — on by default), sent as "1"/"0" like the single flow.
-    // The Worker forwards it through the JobCoordinator to the container per
-    // PDF, so batch results carry the same per-field `consensus` maps as the
-    // single flow (rendered by the shared brand-card renderer) when toggled on.
-    form.append("consensus", consensus ? "1" : "0");
-
-    fetch("/api/jobs", { method: "POST", body: form })
+    fetch("/api/jobs/stage", {
+      method: "POST",
+      headers: {
+        "Accept": "application/json",
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ config: config, manifest: manifest })
+    })
       .then(function (resp) {
-        return resp.text().then(function (text) {
-          var data = null;
-          try { data = text ? JSON.parse(text) : null; } catch (e) { data = null; }
-          if (!resp.ok || !data || !data.jobId) {
-            var msg = (data && data.error) ||
-              ("Server returned HTTP " + resp.status + (text ? (": " + text.slice(0, 200)) : ""));
-            throw new Error(msg);
+        return expectJsonResponse(resp, "uploadId");
+      })
+      .then(function (stage) {
+        if (!Array.isArray(stage.uploads) || stage.uploads.length !== files.length) {
+          throw new Error("Server returned an invalid upload manifest.");
+        }
+
+        var uploadsByIndex = {};
+        stage.uploads.forEach(function (upload) {
+          if (
+            upload &&
+            typeof upload.index === "number" &&
+            typeof upload.url === "string"
+          ) {
+            uploadsByIndex[upload.index] = upload;
           }
-          return data.jobId;
+        });
+
+        var sequence = Promise.resolve();
+        files.forEach(function (file, index) {
+          sequence = sequence.then(function () {
+            var upload = uploadsByIndex[index];
+            if (!upload) {
+              throw new Error("Server omitted the upload URL for '" + file.name + "'.");
+            }
+            return uploadStageFile(upload, file, index, files.length);
+          });
+        });
+
+        return sequence.then(function () {
+          batchSubmitLabel.textContent = "Starting job...";
+          return fetch(
+            "/api/jobs/stage/" + encodeURIComponent(stage.uploadId) + "/start",
+            {
+              method: "POST",
+              headers: { "Accept": "application/json" }
+            }
+          ).then(function (resp) {
+            return expectJsonResponse(resp, "jobId");
+          });
         });
       })
-      .then(function (jobId) {
+      .then(function (started) {
+        var jobId = started.jobId;
+        // Nothing becomes a remembered/shareable job until the server has
+        // verified every staged object and committed the idempotent DO start.
         rememberJob(jobId);
-        // Make the page shareable/reloadable: jobId in the URL hash.
         setHashJob(jobId);
         startJob(jobId, { fresh: true });
       })
@@ -574,6 +719,9 @@
     if (pi != null) {
       var pdf = ensurePdfSection(pi, evt.filename);
       switch (evt.event) {
+        case "pdf_reset":
+          resetPdfAttempt(pi, pdf, evt);
+          break;
         case "start":
           if (Array.isArray(evt.brands) && evt.brands.length) {
             pdf.brands = evt.brands.slice();
@@ -602,9 +750,10 @@
         case "error":
           if (evt.brand) {
             // Per-brand failure: render an error card; the PDF itself continues.
-            renderBatchBrandError(pdf, evt.brand, evt.error);
+            renderBatchBrandError(pdf, evt.brand, evt.error, evt);
           } else {
             // Fatal failure for this PDF — mark the whole PDF failed + done.
+            applyEventState(evt);
             setPdfStatus(pi, "failed", evt.error || "failed");
             markPdfDone(pi, true);
           }
@@ -652,7 +801,8 @@
       manifest.forEach(function (p, i) {
         var idx = (p && typeof p.pdf_index === "number") ? p.pdf_index
           : (p && typeof p.index === "number") ? p.index : i;
-        ensurePdfSection(idx, p && p.filename);
+        var pdf = ensurePdfSection(idx, p && p.filename);
+        if (p && typeof p.attempt === "number") pdf.attempt = p.attempt;
         if (p && (p.status === "done" || p.status === "complete")) markPdfDone(idx, false);
         if (p && p.status === "failed") markPdfDone(idx, true);
       });
@@ -729,6 +879,7 @@
       brands: null,
       cards: {},
       cardSeq: 0,
+      attempt: 1,
       done: false,
       failed: false
     };
@@ -761,9 +912,20 @@
     pdf.statusEl.textContent = text || kind;
   }
 
+  function applyEventState(evt) {
+    job.eventState = BatchState.applyBatchEvent(job.eventState, evt);
+    job.results = job.eventState.results.slice();
+  }
+
   function markPdfDone(pi, failed) {
     var pdf = job.pdfs[pi];
     if (!pdf || pdf.done) return;
+    applyEventState({
+      event: "pdf_done",
+      pdf_index: pi,
+      filename: pdf.name,
+      failed: !!failed
+    });
     pdf.done = true;
     pdf.failed = !!failed;
     pdf.section.classList.remove("is-analyzing");
@@ -795,14 +957,10 @@
   }
 
   function renderBatchResult(pdf, evt) {
+    applyEventState(evt);
     var card = ensureBrandCard(pdf, evt.brand);
     PA.populateBrandCard(card, evt, pdf.name);
-    // Record for aggregation (replace any prior row for same pdf+brand on replay).
     var pi = evt.pdf_index;
-    job.results = job.results.filter(function (r) {
-      return !(r.pdfIndex === pi && r.brand === evt.brand);
-    });
-    job.results.push({ pdfIndex: pi, filename: pdf.name, brand: evt.brand, data: evt });
     updateAggregates();
     renderPdfHeatmap(pi, pdf);
   }
@@ -819,9 +977,48 @@
     window.PA.analytics.renderHeatmap(pdf.heatmapHost, items);
   }
 
-  function renderBatchBrandError(pdf, brand, msg) {
+  function renderBatchBrandError(pdf, brand, msg, evt) {
+    var pi = evt && typeof evt.pdf_index === "number"
+      ? evt.pdf_index
+      : Number(pdf.section.getAttribute("data-pdf-index"));
+    applyEventState(evt || {
+      event: "error",
+      pdf_index: pi,
+      filename: pdf.name,
+      brand: brand,
+      error: msg
+    });
     var card = ensureBrandCard(pdf, brand);
     PA.fillBrandErrorCard(card, brand, msg);
+    updateAggregates();
+    renderPdfHeatmap(pi, pdf);
+  }
+
+  function resetPdfAttempt(pi, pdf, evt) {
+    applyEventState(evt);
+
+    pdf.done = false;
+    pdf.failed = false;
+    pdf.attempt = typeof evt.attempt === "number" ? evt.attempt : pdf.attempt + 1;
+    pdf.cards = {};
+    pdf.cardSeq = 0;
+    PA.clearChildren(pdf.cardsHost);
+    if (pdf.heatmapHost) {
+      PA.clearChildren(pdf.heatmapHost);
+      pdf.heatmapHost.hidden = true;
+    }
+    pdf.section.classList.remove("is-failed");
+    pdf.section.classList.remove("is-analyzing");
+    setPdfStatus(pi, "queued", "queued for retry");
+
+    // Reset is the one path where progress must move backward. Assign the
+    // reducer counts directly instead of using countDonePdfs' monotonic ratchet.
+    job.completedPdfs = job.eventState.completedPdfs;
+    job.failedPdfs = job.eventState.failedPdfs;
+
+    if (!job.results.length && batchExportBar) batchExportBar.hidden = true;
+    updateAggregates();
+    updateProgressUI();
   }
 
   // =========================================================================
@@ -1091,7 +1288,18 @@
         var perrs = (p && Array.isArray(p.errors)) ? p.errors : [];
         perrs.forEach(function (er) {
           if (er && er.brand) {
-            renderBatchBrandError(job.pdfs[pi], er.brand, er.message || "failed");
+            renderBatchBrandError(
+              job.pdfs[pi],
+              er.brand,
+              er.message || "failed",
+              {
+                event: "error",
+                pdf_index: pi,
+                filename: fname,
+                brand: er.brand,
+                error: er.message || "failed"
+              }
+            );
           }
         });
         markPdfDone(pi, p && p.status === "failed");

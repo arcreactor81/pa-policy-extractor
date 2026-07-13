@@ -95,10 +95,34 @@ def _install_heavy_dep_stubs() -> None:
 
         dc_document.DoclingDocument = DoclingDocument
 
-    # requests (pipeline.llm imports it at module scope; we always mock llm.chat,
-    # so a stub with no real HTTP is enough).
+    # requests (pipeline.llm imports it at module scope). Retry tests exercise
+    # its exception taxonomy directly, so the no-requests CI path needs the same
+    # four retryable transport classes that production code references.
     if importlib.util.find_spec("requests") is None:
         req = _stub("requests")
+
+        class RequestException(Exception):
+            """Minimal base matching requests.exceptions.RequestException."""
+
+        class Timeout(RequestException):
+            """Minimal timeout stand-in."""
+
+        class ConnectionError(RequestException):
+            """Minimal connection-error stand-in."""
+
+        class ChunkedEncodingError(RequestException):
+            """Minimal chunked-transfer stand-in."""
+
+        class ContentDecodingError(RequestException):
+            """Minimal content-decoding stand-in."""
+
+        req.exceptions = types.SimpleNamespace(
+            RequestException=RequestException,
+            Timeout=Timeout,
+            ConnectionError=ConnectionError,
+            ChunkedEncodingError=ChunkedEncodingError,
+            ContentDecodingError=ContentDecodingError,
+        )
         req.post = lambda *a, **k: (_ for _ in ()).throw(  # pragma: no cover
             RuntimeError("network disabled in tests")
         )

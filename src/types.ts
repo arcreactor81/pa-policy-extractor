@@ -331,6 +331,17 @@ export type AnalyzeEvent =
 /** Status of a job and each of its PDFs. */
 export type JobStatus = "pending" | "running" | "complete" | "failed";
 
+/** Completed-work cursor for durable job finalization. */
+export type JobFinalizationState =
+  | "none"
+  | "prepared"
+  | "aggregate_committed"
+  | "library_committed"
+  | "cohort_committed"
+  | "webhook_committed"
+  | "terminal_committed"
+  | "abandoned";
+
 /** POST /api/jobs accepted response (202). */
 export interface JobCreatedResponse {
   jobId: string;
@@ -341,9 +352,22 @@ export interface JobPdfState {
   index: number;
   filename: string;
   status: JobStatus;
+  /** Active processing attempt; absent only on responses from older deployments. */
+  attempt?: number;
   /** Number of per-brand `result` events seen for this PDF so far. */
   results: number;
   error?: string;
+}
+
+/** Persisted and streamed watchdog reset for one PDF. */
+export interface JobPdfResetEvent {
+  event: "pdf_reset";
+  reason: "watchdog_resume";
+  previous_attempt: number;
+  attempt: number;
+  pdf_index: number;
+  filename: string;
+  seq_num: number;
 }
 
 /** GET /api/jobs/:id — the pollable job state. */
@@ -360,6 +384,10 @@ export interface JobState {
   /** Highest seq_num emitted so far (resume the WS stream from here). */
   last_seq: number;
   created_at: number;
+  /** Present once durable finalization has started. */
+  finalize_state?: JobFinalizationState;
+  /** Sanitized diagnostic for the most recent finalization failure. */
+  finalize_error?: string;
 }
 
 /**
@@ -396,7 +424,7 @@ export type LibraryKind = "single" | "batch";
  * faceting; the full result JSON lives in R2 at `result_key`.
  */
 export interface LibraryRow {
-  /** uuid primary key; also the R2 object id (results/lib/<id>.json). */
+  /** Random UUID for interactive saves or deterministic SHA-256 for batch rows. */
   id: string;
   /** Unix epoch ms the row was saved. */
   created_at: number;
@@ -621,9 +649,8 @@ export interface CohortCompareResponse {
 }
 
 /**
- * The best-effort JSON summary the JobCoordinator POSTs to a cohort run's
- * webhook_url on finalize (and stores in cohort_runs.summary_json). SSRF-guarded
- * (https + non-private host) before the POST. Webhook failure NEVER fails the job.
+ * The JSON summary the JobCoordinator stores in cohort_runs.summary_json and
+ * delivers to the configured webhook as a hard-gated finalization stage.
  */
 export interface CohortWebhookSummary {
   cohort_id: string;

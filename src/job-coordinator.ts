@@ -14,14 +14,13 @@
  *   3. Every container event is given a monotonic `seq_num`, wrapped with
  *      {pdf_index, filename, seq_num}, appended to the `job_events` SQLite log
  *      AND broadcast to every connected (hibernatable) WebSocket for this job.
- *   4. When all PDFs finish, the aggregated results are written to R2
- *      (results/<jobId>.json), the job is marked complete, and a terminal
- *      {"event":"job_done", ...} event is emitted.
+ *   4. When all PDFs finish, a persisted finalization state machine commits the
+ *      aggregate, library, cohort, webhook, and terminal stages in order.
  *   5. The DO's single alarm slot is multiplexed: while the job is NON-terminal
- *      it is a short-cadence WATCHDOG that resumes processing orphaned by a DO
- *      restart (processing rides waitUntil, which restarts silently kill);
- *      once terminal it becomes the retention alarm (RETENTION_DAYS, default 7)
- *      that deletes the job's R2 objects + this DO's storage. Idempotent.
+ *      it is a short-cadence WATCHDOG that resumes processing or finalization
+ *      orphaned by a DO restart; once terminal it becomes the retention alarm
+ *      (RETENTION_DAYS, default 7) that deletes the job's R2 objects + this DO's
+ *      storage. Idempotent.
  *
  * WebSocket streaming uses the HIBERNATION API (acceptWebSocket /
  * getWebSockets / serializeAttachment) so an idle job bills zero duration while
@@ -54,6 +53,17 @@ const ROUTE_PREFIX = "pa-";
 /** Job lifecycle states persisted in the `jobs` table. */
 export type JobStatus = "pending" | "running" | "complete" | "failed";
 
+/** Completed-work cursor for the durable finalization state machine. */
+export type FinalizationState =
+  | "none"
+  | "prepared"
+  | "aggregate_committed"
+  | "library_committed"
+  | "cohort_committed"
+  | "webhook_committed"
+  | "terminal_committed"
+  | "abandoned";
+
 /** The immutable job config captured at submission time (stored as JSON). */
 export interface JobConfig {
   /** CSV of brands forwarded to the container's `brands` field. */
@@ -82,8 +92,8 @@ export interface JobConfig {
 
   /**
    * Validated https webhook URL to notify on finalize (a cohort run). The DO
-   * re-applies the SSRF guard before POSTing and the POST is BEST-EFFORT — a
-   * webhook failure NEVER fails the job.
+   * re-applies the SSRF guard before POSTing. Delivery is a hard finalization
+   * gate and is retried with a stable Idempotency-Key until it succeeds.
    */
   webhook_url?: string;
 
@@ -118,6 +128,8 @@ export interface PerPdfState {
   index: number;
   filename: string;
   status: JobStatus;
+  /** Active processing attempt for this PDF (starts at 1). */
+  attempt: number;
   /** Number of `result` events seen for this PDF (one per brand). */
   results: number;
   /** Populated on a per-PDF failure. */
@@ -138,6 +150,10 @@ export interface JobStateResponse {
   /** Highest seq_num emitted so far (clients can resume from here). */
   last_seq: number;
   created_at: number;
+  /** Present once durable finalization has started. */
+  finalize_state?: FinalizationState;
+  /** Sanitized diagnostic for the most recent finalization failure. */
+  finalize_error?: string;
 }
 
 /** The aggregated results document written to R2 results/<jobId>.json. */
@@ -168,6 +184,57 @@ interface SocketAttachment {
   lastSeq: number;
 }
 
+type FinalizationJobRow = {
+  id: string;
+  status: string;
+  created_at: number;
+  total_pdfs: number;
+  completed_pdfs: number;
+  failed_pdfs: number;
+  config_json: string;
+  finalization_state: string;
+  final_status: string | null;
+  finalized_at: number | null;
+  finalization_error: string | null;
+};
+
+type FinalizationPdfRow = {
+  pdf_index: number;
+  filename: string;
+  status: string;
+  attempt: number;
+  results: number;
+  error: string | null;
+  file_sha256: string | null;
+};
+
+type FinalizationData = {
+  job: FinalizationJobRow;
+  state: FinalizationState;
+  finalStatus: JobStatus;
+  finalizedAt: number;
+  owner: string;
+  processingAbandoned: boolean;
+  pdfRows: FinalizationPdfRow[];
+  byPdf: Map<number, Record<string, unknown>[]>;
+  errorsByPdf: Map<number, { brand: string; message: string }[]>;
+  results: JobResults;
+};
+
+const FINALIZATION_ORDER: FinalizationState[] = [
+  "none",
+  "prepared",
+  "aggregate_committed",
+  "library_committed",
+  "cohort_committed",
+  "webhook_committed",
+  "terminal_committed",
+  "abandoned",
+];
+
+const PROCESSING_ABANDONED = "abandoned: processing-time ceiling";
+const FINALIZATION_ABANDONED = "abandoned: finalization-time ceiling";
+
 /** Hex-encode an ArrayBuffer (used for the sha256 container route key). */
 function toHex(buf: ArrayBuffer): string {
   const bytes = new Uint8Array(buf);
@@ -182,6 +249,45 @@ function toHex(buf: ArrayBuffer): string {
 async function sha256hex(bytes: ArrayBuffer): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", bytes);
   return toHex(digest);
+}
+
+function parseFinalizationState(value: string): FinalizationState {
+  if (
+    value === "none" ||
+    value === "prepared" ||
+    value === "aggregate_committed" ||
+    value === "library_committed" ||
+    value === "cohort_committed" ||
+    value === "webhook_committed" ||
+    value === "terminal_committed" ||
+    value === "abandoned"
+  ) {
+    return value;
+  }
+  throw new Error("invalid persisted finalization state");
+}
+
+function finalizationStateAtLeast(
+  current: FinalizationState,
+  expected: FinalizationState
+): boolean {
+  return (
+    FINALIZATION_ORDER.indexOf(current) >=
+    FINALIZATION_ORDER.indexOf(expected)
+  );
+}
+
+function sanitizeFinalizationError(value: unknown): string {
+  const raw = value instanceof Error ? value.message : String(value);
+  const clean = raw
+    .replace(/[^\x20-\x7e]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return (clean || "unknown finalization error").slice(0, 240);
+}
+
+function isProcessingAbandoned(value: string | null): boolean {
+  return Boolean(value?.startsWith(PROCESSING_ABANDONED));
 }
 
 /**
@@ -222,10 +328,9 @@ const WATCHDOG_MS = 3 * 60 * 1000;
 const STREAM_IDLE_MS = 180 * 1000;
 
 /**
- * Abandon ceiling: a job still non-terminal this long after creation has been
- * resurrected repeatedly without converging (instance churn, persistent
- * container failure). Mark it failed so pollers see a terminal state instead
- * of an eternal "running".
+ * Abandon ceiling for each phase. Processing gets MAX_JOB_AGE_MS from job
+ * creation; once finalization is prepared, finalization gets a fresh
+ * MAX_JOB_AGE_MS measured from the frozen finalized_at timestamp.
  */
 const MAX_JOB_AGE_MS = 12 * 60 * 60 * 1000;
 
@@ -249,18 +354,22 @@ export class JobCoordinator extends DurableObject<Env> {
     });
   }
 
-  /** Create the two tables if absent. Cursor consumed implicitly (DDL, no rows). */
+  /** Create the tables if absent and fail closed if a migration cannot apply. */
   private initSchema(): void {
     const sql = this.ctx.storage.sql;
     sql.exec(
       `CREATE TABLE IF NOT EXISTS jobs (
-         id              TEXT PRIMARY KEY,
-         status          TEXT NOT NULL,
-         created_at      INTEGER NOT NULL,
-         total_pdfs      INTEGER NOT NULL,
-         completed_pdfs  INTEGER NOT NULL DEFAULT 0,
-         failed_pdfs     INTEGER NOT NULL DEFAULT 0,
-         config_json     TEXT NOT NULL
+         id                  TEXT PRIMARY KEY,
+         status              TEXT NOT NULL,
+         created_at          INTEGER NOT NULL,
+         total_pdfs          INTEGER NOT NULL,
+         completed_pdfs      INTEGER NOT NULL DEFAULT 0,
+         failed_pdfs         INTEGER NOT NULL DEFAULT 0,
+         config_json         TEXT NOT NULL,
+         finalization_state  TEXT NOT NULL DEFAULT 'none',
+         final_status        TEXT,
+         finalized_at        INTEGER,
+         finalization_error  TEXT
        );`
     );
     sql.exec(
@@ -268,6 +377,7 @@ export class JobCoordinator extends DurableObject<Env> {
          seq_num     INTEGER PRIMARY KEY,
          event_type  TEXT NOT NULL,
          pdf_index   INTEGER NOT NULL,
+         attempt     INTEGER NOT NULL DEFAULT 1,
          brand       TEXT,
          payload     TEXT NOT NULL,
          created_at  INTEGER NOT NULL
@@ -282,22 +392,64 @@ export class JobCoordinator extends DurableObject<Env> {
          pdf_index   INTEGER PRIMARY KEY,
          filename    TEXT NOT NULL,
          status      TEXT NOT NULL,
+         attempt     INTEGER NOT NULL DEFAULT 1,
          results     INTEGER NOT NULL DEFAULT 0,
          error       TEXT,
          file_sha256 TEXT
        );`
     );
-    // Defensive migration: the v3 migration already created this DO class, so a
-    // DEPLOYED JobCoordinator's job_pdfs table predates the file_sha256 column
-    // and CREATE TABLE IF NOT EXISTS above will NOT add it. ALTER it in for those
-    // older instances. SQLite has no "ADD COLUMN IF NOT EXISTS", so adding a
-    // column that already exists throws "duplicate column name" — which we
-    // swallow, making this idempotent for both fresh and existing tables.
+    // Defensive migrations: deployed JobCoordinator instances may predate the
+    // file_sha256 and attempt columns. CREATE TABLE IF NOT EXISTS above does not
+    // alter those existing tables. SQLite has no ADD COLUMN IF NOT EXISTS, so
+    // duplicate-column errors are swallowed to keep every migration idempotent.
     try {
       sql.exec("ALTER TABLE job_pdfs ADD COLUMN file_sha256 TEXT");
     } catch {
-      // Column already present (fresh table or a prior run) — nothing to do.
+      // Column already present.
     }
+    try {
+      sql.exec(
+        "ALTER TABLE job_pdfs ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1"
+      );
+    } catch {
+      // Column already present.
+    }
+    try {
+      sql.exec(
+        "ALTER TABLE job_events ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1"
+      );
+    } catch {
+      // Column already present.
+    }
+
+    // Finalization migrations are inspected before ALTER instead of swallowing
+    // errors. A real migration failure must prevent the object from running with
+    // a partially available state machine.
+    const jobColumns = new Set(
+      sql
+        .exec<{ name: string }>("PRAGMA table_info(jobs)")
+        .toArray()
+        .map((column) => column.name)
+    );
+    if (!jobColumns.has("finalization_state")) {
+      sql.exec(
+        "ALTER TABLE jobs ADD COLUMN finalization_state TEXT NOT NULL DEFAULT 'none'"
+      );
+    }
+    if (!jobColumns.has("final_status")) {
+      sql.exec("ALTER TABLE jobs ADD COLUMN final_status TEXT");
+    }
+    if (!jobColumns.has("finalized_at")) {
+      sql.exec("ALTER TABLE jobs ADD COLUMN finalized_at INTEGER");
+    }
+    if (!jobColumns.has("finalization_error")) {
+      sql.exec("ALTER TABLE jobs ADD COLUMN finalization_error TEXT");
+    }
+
+    // Intentionally no composite job_events attempt index: each Durable Object
+    // owns one modest job log, so active-attempt finalization scans stay bounded.
+    // Avoiding the index also avoids a permanent migration and write amplification
+    // on every hot-path event append.
   }
 
   // ── seq_num allocation ──────────────────────────────────────────────────────
@@ -393,7 +545,11 @@ export class JobCoordinator extends DurableObject<Env> {
     };
 
     sql.exec(
-      "INSERT INTO jobs (id, status, created_at, total_pdfs, completed_pdfs, failed_pdfs, config_json) VALUES (?, ?, ?, ?, 0, 0, ?)",
+      `INSERT INTO jobs
+         (id, status, created_at, total_pdfs, completed_pdfs, failed_pdfs,
+          config_json, finalization_state, final_status, finalized_at,
+          finalization_error)
+       VALUES (?, ?, ?, ?, 0, 0, ?, 'none', NULL, NULL, NULL)`,
       body.jobId,
       "running",
       createdAt,
@@ -403,7 +559,7 @@ export class JobCoordinator extends DurableObject<Env> {
 
     for (const pdf of body.pdfs) {
       sql.exec(
-        "INSERT INTO job_pdfs (pdf_index, filename, status, results, error) VALUES (?, ?, 'pending', 0, NULL)",
+        "INSERT INTO job_pdfs (pdf_index, filename, status, attempt, results, error) VALUES (?, ?, 'pending', 1, 0, NULL)",
         pdf.index,
         pdf.filename
       );
@@ -438,30 +594,38 @@ export class JobCoordinator extends DurableObject<Env> {
       await this.processJob(jobId, config);
     } finally {
       this.processing = false;
-      // Terminal (finalizeJob ran, even on the all-failed path): hand the alarm
-      // slot to retention. On an unexpected throw the job may still be
-      // non-terminal — the watchdog scheduled by alarm()/handleStart resumes it.
+      // Terminal (finalizeJob ran, including forced finalization abandonment):
+      // hand the alarm slot to retention. On an unexpected throw the job stays
+      // non-terminal and the watchdog resumes its persisted stage.
       const rows = this.ctx.storage.sql
         .exec<{ status: string; created_at: number }>(
           "SELECT status, created_at FROM jobs WHERE id = ?",
           jobId
         )
         .toArray();
-      if (rows.length && (rows[0].status === "complete" || rows[0].status === "failed")) {
-        const retentionDays = Number(this.env.RETENTION_DAYS ?? "7") || 7;
-        void this.ctx.storage.setAlarm(
-          Math.max(
-            Date.now() + 1000,
-            rows[0].created_at + retentionDays * 24 * 60 * 60 * 1000
-          )
-        );
+      if (
+        rows.length &&
+        (rows[0].status === "complete" || rows[0].status === "failed")
+      ) {
+        this.scheduleRetention(rows[0].created_at);
       }
     }
   }
 
+  /** Arm retention from the immutable job creation timestamp. */
+  private scheduleRetention(createdAt: number): void {
+    const retentionDays = Number(this.env.RETENTION_DAYS ?? "7") || 7;
+    void this.ctx.storage.setAlarm(
+      Math.max(
+        Date.now() + 1000,
+        createdAt + retentionDays * 24 * 60 * 60 * 1000
+      )
+    );
+  }
+
   /**
    * Drive every PDF through the container with a bounded concurrency semaphore,
-   * then aggregate + persist results and emit the terminal job_done event.
+   * then enter or resume durable finalization.
    */
   private async processJob(jobId: string, config: JobConfig): Promise<void> {
     const maxConcurrent = Math.max(
@@ -469,24 +633,39 @@ export class JobCoordinator extends DurableObject<Env> {
       Number(this.env.MAX_CONCURRENT_PDFS ?? "2") || 2
     );
 
-    // RESUME-SAFE queue: only PDFs not already terminal. On a fresh start that
-    // is every PDF; on a watchdog resume after a DO restart, completed/failed
-    // PDFs keep their state and only the orphaned ones re-run.
-    const terminal = new Set(
-      this.ctx.storage.sql
-        .exec<{ pdf_index: number }>(
-          "SELECT pdf_index FROM job_pdfs WHERE status IN ('complete','failed')"
-        )
-        .toArray()
-        .map((r) => r.pdf_index)
-    );
-    const queue = config.pdfs.filter((p) => !terminal.has(p.index));
+    // RESUME-SAFE queue: select each non-terminal PDF together with its active
+    // attempt. A fresh job starts at attempt 1; watchdog recovery increments the
+    // attempt before rebuilding this queue.
+    const pendingRows = this.ctx.storage.sql
+      .exec<{ pdf_index: number; attempt: number }>(
+        "SELECT pdf_index, attempt FROM job_pdfs WHERE status NOT IN ('complete','failed') ORDER BY pdf_index"
+      )
+      .toArray();
+    const configByIndex = new Map(config.pdfs.map((pdf) => [pdf.index, pdf]));
+    const queue: { index: number; filename: string; attempt: number }[] = [];
+    for (const row of pendingRows) {
+      const pdf = configByIndex.get(row.pdf_index);
+      if (pdf) {
+        queue.push({
+          index: pdf.index,
+          filename: pdf.filename,
+          attempt: row.attempt,
+        });
+      }
+    }
+
     const workers: Promise<void>[] = [];
     const runNext = async (): Promise<void> => {
       for (;;) {
         const pdf = queue.shift();
         if (!pdf) return;
-        await this.processPdf(jobId, config, pdf.index, pdf.filename);
+        await this.processPdf(
+          jobId,
+          config,
+          pdf.index,
+          pdf.filename,
+          pdf.attempt
+        );
       }
     };
     for (let i = 0; i < Math.min(maxConcurrent, queue.length); i++) {
@@ -505,7 +684,8 @@ export class JobCoordinator extends DurableObject<Env> {
     jobId: string,
     config: JobConfig,
     pdfIndex: number,
-    filename: string
+    filename: string,
+    attempt: number
   ): Promise<void> {
     try {
       const key = `pdfs/${jobId}/${pdfIndex}.pdf`;
@@ -517,12 +697,14 @@ export class JobCoordinator extends DurableObject<Env> {
 
       // Sticky container routing by content hash (OCR-once cache reuse). The
       // same hash is the persistent-library cache key, so store it on the PDF row
-      // for finalizeJob to read back. Cursor: DML, no rows.
+      // for finalizeJob to read back. The attempt guard prevents a stale worker
+      // from writing into a later recovery attempt.
       const sha = await sha256hex(bytes);
       this.ctx.storage.sql.exec(
-        "UPDATE job_pdfs SET file_sha256 = ? WHERE pdf_index = ?",
+        "UPDATE job_pdfs SET file_sha256 = ? WHERE pdf_index = ? AND attempt = ?",
         sha,
-        pdfIndex
+        pdfIndex,
+        attempt
       );
       const route = ROUTE_PREFIX + sha;
 
@@ -561,7 +743,8 @@ export class JobCoordinator extends DurableObject<Env> {
         res.body,
         jobId,
         pdfIndex,
-        filename
+        filename,
+        attempt
       );
 
       // The container streamed a PDF-LEVEL fatal (an {"event":"error"} with no
@@ -571,46 +754,56 @@ export class JobCoordinator extends DurableObject<Env> {
       // Record the PDF as FAILED (a per-brand error still leaves it complete).
       if (!outcome.ok) {
         this.markPdf(
+          jobId,
           pdfIndex,
+          attempt,
           "failed",
           outcome.fatalError ?? "extraction did not complete"
         );
-        this.bumpJobCounter(jobId, "failed_pdfs");
         return;
       }
 
       // The stream reached `done`, but `done` alone does not mean any brand
       // succeeded: per-brand errors are non-fatal, so EVERY brand may have
-      // errored with zero `result` events. Read back the per-PDF result count
-      // (tracked in job_pdfs by emitRawLine) and fail such a PDF instead of
-      // recording an empty "complete". Cursor consumed synchronously.
+      // errored with zero `result` events. Read back the active-attempt result
+      // count and fail such a PDF instead of recording an empty "complete".
       const countRows = this.ctx.storage.sql
         .exec<{ results: number }>(
-          "SELECT results FROM job_pdfs WHERE pdf_index = ?",
-          pdfIndex
+          "SELECT results FROM job_pdfs WHERE pdf_index = ? AND attempt = ?",
+          pdfIndex,
+          attempt
         )
         .toArray();
       const resultCount = countRows.length ? countRows[0].results : 0;
       const verdict = pdfOutcomeAfterDone(resultCount);
       if (verdict.status === "failed") {
-        this.markPdf(pdfIndex, "failed", verdict.error);
-        this.bumpJobCounter(jobId, "failed_pdfs");
+        this.markPdf(
+          jobId,
+          pdfIndex,
+          attempt,
+          "failed",
+          verdict.error
+        );
         return;
       }
 
       // Per-PDF success.
-      this.markPdf(pdfIndex, "complete");
-      this.bumpJobCounter(jobId, "completed_pdfs");
+      this.markPdf(jobId, pdfIndex, attempt, "complete");
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       // Surface a per-PDF error event into the log/stream (mirrors the
       // container's own per-brand error shape but at PDF granularity).
-      this.emit(jobId, pdfIndex, filename, {
-        event: "error",
-        error: message,
-      });
-      this.markPdf(pdfIndex, "failed", message);
-      this.bumpJobCounter(jobId, "failed_pdfs");
+      this.emit(
+        jobId,
+        pdfIndex,
+        filename,
+        {
+          event: "error",
+          error: message,
+        },
+        attempt
+      );
+      this.markPdf(jobId, pdfIndex, attempt, "failed", message);
     }
   }
 
@@ -631,7 +824,8 @@ export class JobCoordinator extends DurableObject<Env> {
     body: ReadableStream<Uint8Array>,
     jobId: string,
     pdfIndex: number,
-    filename: string
+    filename: string,
+    attempt: number
   ): Promise<{ ok: boolean; fatalError?: string }> {
     const reader = body.getReader();
     const decoder = new TextDecoder();
@@ -641,7 +835,13 @@ export class JobCoordinator extends DurableObject<Env> {
     let fatalError: string | undefined;
 
     const observe = (line: string): void => {
-      const out = this.emitRawLine(jobId, pdfIndex, filename, line);
+      const out = this.emitRawLine(
+        jobId,
+        pdfIndex,
+        filename,
+        line,
+        attempt
+      );
       if (out.done) sawDone = true;
       // First PDF-level fatal wins as the recorded reason.
       if (out.fatalError !== undefined && fatalError === undefined) {
@@ -702,7 +902,8 @@ export class JobCoordinator extends DurableObject<Env> {
     jobId: string,
     pdfIndex: number,
     filename: string,
-    line: string
+    line: string,
+    attempt: number
   ): { done: boolean; fatalError?: string } {
     let parsed: Record<string, unknown>;
     try {
@@ -711,13 +912,14 @@ export class JobCoordinator extends DurableObject<Env> {
       // Non-JSON noise from the stream — wrap it so nothing is silently lost.
       parsed = { event: "error", error: "malformed event from container" };
     }
-    this.emit(jobId, pdfIndex, filename, parsed);
+    this.emit(jobId, pdfIndex, filename, parsed, attempt);
 
-    // Track per-PDF result count for the poll endpoint.
+    // Track the active attempt's per-PDF result count for the poll endpoint.
     if (parsed.event === "result") {
       this.ctx.storage.sql.exec(
-        "UPDATE job_pdfs SET results = results + 1 WHERE pdf_index = ?",
-        pdfIndex
+        "UPDATE job_pdfs SET results = results + 1 WHERE pdf_index = ? AND attempt = ?",
+        pdfIndex,
+        attempt
       );
     }
 
@@ -735,17 +937,16 @@ export class JobCoordinator extends DurableObject<Env> {
   }
 
   /**
-   * Assign the next seq_num, wrap the raw event, PERSIST it to job_events, and
-   * BROADCAST it to every connected WebSocket for this job. All SQLite cursors
-   * here are consumed synchronously (nextSeq reads-then-caches; the INSERT
-   * returns no rows). There is no `await` inside this method.
+   * Assign the next seq_num, wrap the raw event, and persist it to job_events.
+   * The attempt is stored only in the SQLite column; existing event envelopes
+   * remain byte-for-byte compatible. There is no await inside this method.
    */
-  private emit(
-    jobId: string,
+  private appendEvent(
     pdfIndex: number,
     filename: string,
-    raw: Record<string, unknown>
-  ): void {
+    raw: Record<string, unknown>,
+    attempt: number
+  ): { envelope: JobEvent; seq: number } {
     const seq = this.nextSeq();
     const envelope: JobEvent = {
       ...raw,
@@ -759,16 +960,33 @@ export class JobCoordinator extends DurableObject<Env> {
     const brand = typeof raw.brand === "string" ? (raw.brand as string) : null;
 
     this.ctx.storage.sql.exec(
-      "INSERT INTO job_events (seq_num, event_type, pdf_index, brand, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+      "INSERT INTO job_events (seq_num, event_type, pdf_index, attempt, brand, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
       seq,
       eventType,
       pdfIndex,
+      attempt,
       brand,
       JSON.stringify(envelope),
       Date.now()
     );
 
-    this.broadcast(jobId, envelope, seq);
+    return { envelope, seq };
+  }
+
+  /**
+   * Persist one event, then broadcast it. Watchdog recovery calls appendEvent
+   * inside its reset transaction and broadcasts only after that transaction
+   * commits, preserving reset/event crash atomicity.
+   */
+  private emit(
+    jobId: string,
+    pdfIndex: number,
+    filename: string,
+    raw: Record<string, unknown>,
+    attempt: number
+  ): void {
+    const appended = this.appendEvent(pdfIndex, filename, raw, attempt);
+    this.broadcast(jobId, appended.envelope, appended.seq);
   }
 
   /** Send an envelope to every live socket for this job (best-effort). */
@@ -786,69 +1004,162 @@ export class JobCoordinator extends DurableObject<Env> {
     }
   }
 
-  /** Update a PDF row's status (+ optional error). Cursor: DML, no rows. */
-  private markPdf(pdfIndex: number, status: JobStatus, error?: string): void {
-    this.ctx.storage.sql.exec(
-      "UPDATE job_pdfs SET status = ?, error = ? WHERE pdf_index = ?",
-      status,
-      error ?? null,
-      pdfIndex
-    );
-  }
-
   /**
-   * Atomically increment one of the job's counters. Cursor: DML, no rows.
-   * The DO is one-job, so the unqualified UPDATE would hit the right row; the
-   * `WHERE id = ?` is a defensive guard scoping the write to this job's row.
+   * Atomically transition the active attempt to a terminal state and increment
+   * the matching job counter only when that exact attempt actually transitioned.
+   * UPDATE RETURNING makes stale completions a no-op.
    */
-  private bumpJobCounter(
+  private markPdf(
     jobId: string,
-    column: "completed_pdfs" | "failed_pdfs"
-  ): void {
-    this.ctx.storage.sql.exec(
-      `UPDATE jobs SET ${column} = ${column} + 1 WHERE id = ?`,
-      jobId
-    );
+    pdfIndex: number,
+    attempt: number,
+    status: JobStatus,
+    error?: string
+  ): boolean {
+    return this.ctx.storage.transactionSync(() => {
+      const transitioned = this.ctx.storage.sql
+        .exec<{ pdf_index: number }>(
+          "UPDATE job_pdfs SET status = ?, error = ? WHERE pdf_index = ? AND attempt = ? AND status NOT IN ('complete','failed') RETURNING pdf_index",
+          status,
+          error ?? null,
+          pdfIndex,
+          attempt
+        )
+        .toArray();
+
+      if (transitioned.length === 0) {
+        return false;
+      }
+
+      const column =
+        status === "complete"
+          ? "completed_pdfs"
+          : status === "failed"
+            ? "failed_pdfs"
+            : null;
+      if (column) {
+        this.ctx.storage.sql.exec(
+          `UPDATE jobs SET ${column} = ${column} + 1 WHERE id = ?`,
+          jobId
+        );
+      }
+      return true;
+    });
   }
 
+  // ── Durable finalization ────────────────────────────────────────────────────
+
   /**
-   * Aggregate every PDF's `result` events from the log, write the results doc to
-   * R2, mark the job complete (or failed if every PDF failed), and emit the
-   * terminal job_done event.
+   * Freeze terminal inputs before the first external side effect. Job status
+   * deliberately stays "running" until the final transaction.
    */
-  private async finalizeJob(jobId: string, config: JobConfig): Promise<void> {
+  private prepareFinalization(jobId: string): void {
+    this.ctx.storage.transactionSync(() => {
+      const rows = this.ctx.storage.sql
+        .exec<FinalizationJobRow>(
+          `SELECT id, status, created_at, total_pdfs, completed_pdfs,
+                  failed_pdfs, config_json, finalization_state, final_status,
+                  finalized_at, finalization_error
+           FROM jobs WHERE id = ?`,
+          jobId
+        )
+        .toArray();
+      if (rows.length === 0) {
+        throw new Error("finalization invariant: job row missing");
+      }
+
+      const job = rows[0];
+      const state = parseFinalizationState(job.finalization_state);
+      if (state !== "none") return;
+
+      const pending = this.ctx.storage.sql
+        .exec<{ count: number }>(
+          `SELECT COUNT(*) AS count
+           FROM job_pdfs
+           WHERE status NOT IN ('complete','failed')`
+        )
+        .toArray();
+      if ((pending[0]?.count ?? 0) !== 0) {
+        throw new Error("finalization invariant: non-terminal PDFs remain");
+      }
+
+      const finalStatus: JobStatus =
+        job.failed_pdfs >= job.total_pdfs && job.total_pdfs > 0
+          ? "failed"
+          : "complete";
+      const finalizedAt = job.finalized_at ?? Date.now();
+
+      const prepared = this.ctx.storage.sql
+        .exec<{ id: string }>(
+          `UPDATE jobs
+           SET finalization_state = 'prepared',
+               final_status = ?,
+               finalized_at = ?,
+               finalization_error = finalization_error
+           WHERE id = ? AND finalization_state = 'none'
+           RETURNING id`,
+          finalStatus,
+          finalizedAt,
+          jobId
+        )
+        .toArray();
+      if (prepared.length !== 1) {
+        throw new Error("finalization invariant: prepare transition failed");
+      }
+    });
+  }
+
+  /** Read stable finalization inputs and active-attempt events synchronously. */
+  private readFinalizationData(
+    jobId: string,
+    config: JobConfig
+  ): FinalizationData {
     const sql = this.ctx.storage.sql;
 
-    // Pull final job + per-PDF state synchronously.
     const jobRows = sql
-      .exec<{
-        created_at: number;
-        completed_pdfs: number;
-        failed_pdfs: number;
-        total_pdfs: number;
-      }>(
-        "SELECT created_at, completed_pdfs, failed_pdfs, total_pdfs FROM jobs WHERE id = ?",
+      .exec<FinalizationJobRow>(
+        `SELECT id, status, created_at, total_pdfs, completed_pdfs,
+                failed_pdfs, config_json, finalization_state, final_status,
+                finalized_at, finalization_error
+         FROM jobs WHERE id = ?`,
         jobId
       )
       .toArray();
+    if (jobRows.length === 0) {
+      throw new Error("finalization invariant: job row missing");
+    }
     const job = jobRows[0];
+    const state = parseFinalizationState(job.finalization_state);
+    if (
+      job.final_status !== "complete" &&
+      job.final_status !== "failed"
+    ) {
+      throw new Error("finalization invariant: final status was not frozen");
+    }
+    if (job.finalized_at === null) {
+      throw new Error("finalization invariant: finalized_at was not frozen");
+    }
 
     const pdfRows = sql
-      .exec<{
-        pdf_index: number;
-        filename: string;
-        status: string;
-        error: string | null;
-        file_sha256: string | null;
-      }>(
-        "SELECT pdf_index, filename, status, error, file_sha256 FROM job_pdfs ORDER BY pdf_index"
+      .exec<FinalizationPdfRow>(
+        `SELECT pdf_index, filename, status, attempt, results, error,
+                file_sha256
+         FROM job_pdfs
+         ORDER BY pdf_index`
       )
       .toArray();
 
-    // Collect the `result` payloads per PDF from the event log.
+    // Only the active attempt contributes to any finalized artifact. Older
+    // attempts remain immutable in the event log for replay and audit.
     const resultRows = sql
       .exec<{ pdf_index: number; payload: string }>(
-        "SELECT pdf_index, payload FROM job_events WHERE event_type = 'result' ORDER BY seq_num"
+        `SELECT e.pdf_index, e.payload
+         FROM job_events e
+         JOIN job_pdfs p
+           ON p.pdf_index = e.pdf_index
+          AND p.attempt = e.attempt
+         WHERE e.event_type = 'result'
+         ORDER BY e.seq_num`
       )
       .toArray();
 
@@ -859,16 +1170,22 @@ export class JobCoordinator extends DurableObject<Env> {
       byPdf.set(row.pdf_index, list);
     }
 
-    // Collect the per-BRAND `error` events per PDF so the results doc records
-    // WHY a brand is missing from `results`. PDF-level fatals carry no brand
-    // (they already surface via the per-PDF `error` column) and are skipped.
     const errorRows = sql
       .exec<{ pdf_index: number; brand: string | null; payload: string }>(
-        "SELECT pdf_index, brand, payload FROM job_events WHERE event_type = 'error' ORDER BY seq_num"
+        `SELECT e.pdf_index, e.brand, e.payload
+         FROM job_events e
+         JOIN job_pdfs p
+           ON p.pdf_index = e.pdf_index
+          AND p.attempt = e.attempt
+         WHERE e.event_type = 'error'
+         ORDER BY e.seq_num`
       )
       .toArray();
 
-    const errorsByPdf = new Map<number, { brand: string; message: string }[]>();
+    const errorsByPdf = new Map<
+      number,
+      { brand: string; message: string }[]
+    >();
     for (const row of errorRows) {
       if (typeof row.brand !== "string" || !row.brand) continue;
       const payload = JSON.parse(row.payload) as Record<string, unknown>;
@@ -879,171 +1196,649 @@ export class JobCoordinator extends DurableObject<Env> {
       errorsByPdf.set(row.pdf_index, list);
     }
 
-    const finishedAt = Date.now();
     const results: JobResults = {
       jobId,
-      created_at: job?.created_at ?? finishedAt,
-      finished_at: finishedAt,
-      config: { brands: config.brands, runs: config.runs, explain: config.explain },
-      pdfs: pdfRows.map((p) => ({
-        index: p.pdf_index,
-        filename: p.filename,
-        status: p.status as JobStatus,
-        error: p.error ?? undefined,
-        results: byPdf.get(p.pdf_index) ?? [],
-        errors: errorsByPdf.get(p.pdf_index) ?? [],
+      created_at: job.created_at,
+      finished_at: job.finalized_at,
+      config: {
+        brands: config.brands,
+        runs: config.runs,
+        explain: config.explain,
+      },
+      pdfs: pdfRows.map((pdf) => ({
+        index: pdf.pdf_index,
+        filename: pdf.filename,
+        status: pdf.status as JobStatus,
+        error: pdf.error ?? undefined,
+        results: byPdf.get(pdf.pdf_index) ?? [],
+        errors: errorsByPdf.get(pdf.pdf_index) ?? [],
       })),
     };
 
-    // Persist the aggregated results to R2 (served by GET /api/results).
-    await this.env.RESULT_BUCKET.put(
-      `results/${jobId}.json`,
-      JSON.stringify(results),
-      { httpMetadata: { contentType: "application/json" } }
+    return {
+      job,
+      state,
+      finalStatus: job.final_status,
+      finalizedAt: job.finalized_at,
+      owner:
+        config.owner && config.owner.trim() ? config.owner : "anonymous",
+      processingAbandoned: isProcessingAbandoned(job.finalization_error),
+      pdfRows,
+      byPdf,
+      errorsByPdf,
+      results,
+    };
+  }
+
+  /** Reject a partially populated cohort linkage before external side effects. */
+  private validateFinalizationConfig(config: JobConfig): void {
+    const hasCohort = Boolean(config.cohort_id);
+    const hasRun = Boolean(config.run_id);
+    if (hasCohort !== hasRun) {
+      throw new Error(
+        "finalization invariant: cohort_id and run_id must be set together"
+      );
+    }
+    if (config.webhook_url && !hasRun) {
+      throw new Error(
+        "finalization invariant: webhook_url requires a cohort run_id"
+      );
+    }
+  }
+
+  /** Advance a completed-work marker after its side effect has committed. */
+  private advanceFinalization(
+    jobId: string,
+    current: FinalizationState,
+    next: FinalizationState
+  ): void {
+    const transitioned = this.ctx.storage.sql
+      .exec<{ id: string }>(
+        `UPDATE jobs
+         SET finalization_state = ?,
+             finalization_error =
+               CASE
+                 WHEN finalization_error LIKE ? THEN ?
+                 ELSE NULL
+               END
+         WHERE id = ? AND finalization_state = ?
+         RETURNING id`,
+        next,
+        `${PROCESSING_ABANDONED}%`,
+        PROCESSING_ABANDONED,
+        jobId,
+        current
+      )
+      .toArray();
+
+    if (transitioned.length === 1) return;
+
+    const rows = this.ctx.storage.sql
+      .exec<{ finalization_state: string }>(
+        "SELECT finalization_state FROM jobs WHERE id = ?",
+        jobId
+      )
+      .toArray();
+    if (
+      rows.length &&
+      finalizationStateAtLeast(
+        parseFinalizationState(rows[0].finalization_state),
+        next
+      )
+    ) {
+      return;
+    }
+    throw new Error(
+      `finalization invariant: could not advance ${current} to ${next}`
     );
+  }
 
-    // Job is complete unless EVERY PDF failed.
-    const total = job?.total_pdfs ?? config.pdfs.length;
-    const failed = job?.failed_pdfs ?? 0;
-    const finalStatus: JobStatus = failed >= total && total > 0 ? "failed" : "complete";
-    sql.exec("UPDATE jobs SET status = ? WHERE id = ?", finalStatus, jobId);
+  /** Persist a sanitized diagnostic without losing the processing marker. */
+  private recordFinalizationFailure(
+    jobId: string,
+    stage: string,
+    error: unknown
+  ): void {
+    const rows = this.ctx.storage.sql
+      .exec<{ finalization_error: string | null }>(
+        "SELECT finalization_error FROM jobs WHERE id = ?",
+        jobId
+      )
+      .toArray();
+    const prefix = isProcessingAbandoned(
+      rows[0]?.finalization_error ?? null
+    )
+      ? `${PROCESSING_ABANDONED}; `
+      : "";
+    const diagnostic = `${prefix}finalization ${stage} failed: ${sanitizeFinalizationError(error)}`;
+    this.ctx.storage.sql.exec(
+      "UPDATE jobs SET finalization_error = ? WHERE id = ? AND status NOT IN ('complete','failed')",
+      diagnostic,
+      jobId
+    );
+  }
 
-    // AUTHORITATIVE library persistence (server-side, survives client disconnect):
-    // write each per-brand result to the OWNER's persistent library — full result
-    // JSON to R2 (results/lib/<id>.json) + an index row to D1 — the SAME shape as
-    // the Worker's POST /api/library. Best-effort: a library failure must NOT fail
-    // the job (results/<jobId>.json is already persisted above). pdfRows/byPdf are
-    // already materialized arrays/maps, so no SQLite cursor is open across these
-    // awaits.
-    const owner = config.owner && config.owner.trim() ? config.owner : "anonymous";
-    for (const p of pdfRows) {
-      const sha = p.file_sha256;
-      if (!sha) continue; // PDF never processed (e.g. read failure) — nothing to cache.
-      const events = byPdf.get(p.pdf_index) ?? [];
-      // The stored `result` events are JobEvent envelopes: the container's result
-      // payload (which mirrors ExtractResult) PLUS the routing/sequencing keys we
-      // add (event/brand/pdf_index/filename/seq_num). Strip those envelope-only
-      // keys so the R2 library doc is a clean ExtractResult (result +
-      // access_justification + meta + confidence + spans + policy_text).
+  /** Persist all active result events with deterministic batch identities. */
+  private async persistFinalizationLibrary(
+    jobId: string,
+    config: JobConfig,
+    data: FinalizationData
+  ): Promise<void> {
+    // Preflight every result-bearing PDF before writing any library rows.
+    for (const pdf of data.pdfRows) {
+      const events = data.byPdf.get(pdf.pdf_index) ?? [];
+      if (events.length > 0 && !pdf.file_sha256) {
+        throw new Error(
+          `finalization invariant: result events for PDF ${pdf.pdf_index} have no file_sha256`
+        );
+      }
+    }
+
+    for (const pdf of data.pdfRows) {
+      const events = data.byPdf.get(pdf.pdf_index) ?? [];
+      if (events.length === 0) continue;
+
       const extractResults: ExtractResult[] = [];
-      for (const e of events) {
-        if ((e as { event?: unknown }).event !== "result") continue;
-        const { event, brand, pdf_index, filename, seq_num, ...rest } =
-          e as Record<string, unknown>;
+      for (const eventEnvelope of events) {
+        if ((eventEnvelope as { event?: unknown }).event !== "result") continue;
+        const {
+          event,
+          brand,
+          pdf_index,
+          filename,
+          seq_num,
+          ...extractResult
+        } = eventEnvelope as Record<string, unknown>;
         void event;
         void brand;
         void pdf_index;
         void filename;
         void seq_num;
-        extractResults.push(rest as unknown as ExtractResult);
+        extractResults.push(extractResult as unknown as ExtractResult);
       }
       if (extractResults.length === 0) continue;
-      try {
-        await persistResults({
-          db: this.env.LIBRARY,
-          bucket: this.env.RESULT_BUCKET,
-          owner,
-          kind: "batch",
-          jobId,
-          fileSha256: sha,
-          runs: config.runs,
-          explain: config.explain,
-          results: extractResults,
-        });
-      } catch (err) {
-        console.error(
-          `library persistence failed for job ${jobId} pdf ${p.pdf_index}:`,
-          err
+
+      await persistResults({
+        db: this.env.LIBRARY,
+        bucket: this.env.RESULT_BUCKET,
+        owner: data.owner,
+        kind: "batch",
+        jobId,
+        fileSha256: pdf.file_sha256 as string,
+        runs: config.runs,
+        explain: config.explain,
+        results: extractResults,
+        batchIdempotency: {
+          pdfIndex: pdf.pdf_index,
+          finalizedAt: data.finalizedAt,
+        },
+      });
+    }
+  }
+
+  /** Build the byte-stable cohort summary used by D1 and webhook stages. */
+  private cohortSummary(
+    jobId: string,
+    config: JobConfig,
+    data: FinalizationData
+  ): {
+    cohort_id: string;
+    run_id: string;
+    job_id: string;
+    status: JobStatus;
+    totals: {
+      total_pdfs: number;
+      completed_pdfs: number;
+      failed_pdfs: number;
+    };
+    per_brand_access: Record<string, number>;
+  } {
+    if (!config.cohort_id || !config.run_id) {
+      throw new Error("finalization invariant: cohort linkage is incomplete");
+    }
+    return {
+      cohort_id: config.cohort_id,
+      run_id: config.run_id,
+      job_id: jobId,
+      status: data.finalStatus,
+      totals: {
+        total_pdfs: data.job.total_pdfs,
+        completed_pdfs: data.job.completed_pdfs,
+        failed_pdfs: data.job.failed_pdfs,
+      },
+      per_brand_access: perBrandAccess(data.byPdf),
+    };
+  }
+
+  /**
+   * Update exactly one cohort run. If zero rows changed, tolerate only a truly
+   * deleted parent cohort; an extant parent with a missing/mismatched run is an
+   * invariant failure.
+   */
+  private async persistCohortStage(
+    jobId: string,
+    config: JobConfig,
+    data: FinalizationData
+  ): Promise<void> {
+    if (!config.cohort_id || !config.run_id) return;
+
+    const summary = this.cohortSummary(jobId, config, data);
+    const updated = await this.env.LIBRARY.prepare(
+      `UPDATE cohort_runs
+       SET status = ?, summary_json = ?
+       WHERE id = ? AND cohort_id = ? AND owner = ?`
+    )
+      .bind(
+        data.finalStatus,
+        JSON.stringify(summary),
+        config.run_id,
+        config.cohort_id,
+        data.owner
+      )
+      .run();
+
+    if (updated.meta.changes === 1) return;
+
+    const parent = await this.env.LIBRARY.prepare(
+      "SELECT id FROM cohorts WHERE id = ? LIMIT 1"
+    )
+      .bind(config.cohort_id)
+      .first<{ id: string }>();
+    if (!parent) {
+      // The cohort and its runs were intentionally deleted while this job ran.
+      return;
+    }
+
+    throw new Error(
+      "finalization invariant: cohort run update changed zero rows"
+    );
+  }
+
+  /**
+   * Hard-gated, SSRF-guarded webhook POST. A non-2xx response, timeout, network
+   * error, or validation failure leaves the job running at webhook_committed's
+   * predecessor so watchdog recovery retries it.
+   */
+  private async postWebhook(
+    webhookUrl: string,
+    summary: unknown,
+    runId: string
+  ): Promise<void> {
+    const verdict = validateWebhookUrl(webhookUrl);
+    if ("error" in verdict) {
+      throw new Error(`cohort webhook rejected: ${verdict.error}`);
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10_000);
+    try {
+      const response = await fetch(verdict.url, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "user-agent": "pa-policy-extractor-cohort-webhook/1",
+          "Idempotency-Key": `pa-policy-extractor/cohort-run/${runId}`,
+        },
+        body: JSON.stringify(summary),
+        redirect: "manual",
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        throw new Error(`cohort webhook returned HTTP ${response.status}`);
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Insert job_done (attempt 0), update the terminal job status, and persist the
+   * terminal finalization marker in one transaction. Broadcast happens only
+   * after commit; replay covers a crash after commit but before broadcast.
+   */
+  private commitTerminal(
+    jobId: string,
+    finalStatus: JobStatus,
+    raw: Record<string, unknown>,
+    state: "terminal_committed" | "abandoned",
+    finalizationError: string | null,
+    expectedState?: FinalizationState
+  ): void {
+    const appended = this.ctx.storage.transactionSync(() => {
+      const rows = this.ctx.storage.sql
+        .exec<{ status: string; finalization_state: string }>(
+          "SELECT status, finalization_state FROM jobs WHERE id = ?",
+          jobId
+        )
+        .toArray();
+      if (rows.length === 0) {
+        throw new Error("finalization invariant: job row missing");
+      }
+      if (
+        rows[0].status === "complete" ||
+        rows[0].status === "failed"
+      ) {
+        return null;
+      }
+
+      const current = parseFinalizationState(rows[0].finalization_state);
+      if (expectedState && current !== expectedState) {
+        throw new Error(
+          `finalization invariant: terminal commit expected ${expectedState}`
         );
       }
-    }
 
-    // ── W5 cohort run: update the cohort_runs row + fire the webhook ──────────
-    // If this job was a COHORT RUN (cohort_id + run_id present in the config),
-    // update its cohort_runs row with the terminal status + a JSON summary and,
-    // if a webhook_url is set, POST that summary. ALL of this is BEST-EFFORT —
-    // the job's own results are already persisted above, so a webhook/D1 failure
-    // here must NEVER fail the job. byPdf is a materialized Map (no open cursor).
-    if (config.cohort_id && config.run_id) {
-      const summary = {
-        cohort_id: config.cohort_id,
-        run_id: config.run_id,
-        job_id: jobId,
-        status: finalStatus,
-        totals: {
-          total_pdfs: total,
-          completed_pdfs: job?.completed_pdfs ?? 0,
-          failed_pdfs: failed,
-        },
-        per_brand_access: perBrandAccess(byPdf),
-      };
-
-      // Update the cohort_runs row (owner-scoped). Best-effort.
-      try {
-        await this.env.LIBRARY.prepare(
-          `UPDATE cohort_runs SET status = ?, summary_json = ? WHERE id = ? AND owner = ?`
+      const existing = this.ctx.storage.sql
+        .exec<{ seq_num: number }>(
+          "SELECT seq_num FROM job_events WHERE event_type = 'job_done' LIMIT 1"
         )
-          .bind(finalStatus, JSON.stringify(summary), config.run_id, owner)
-          .run();
-      } catch (err) {
-        console.error(`cohort_runs update failed for run ${config.run_id}:`, err);
-      }
+        .toArray();
 
-      // Fire the webhook (https + SSRF guard re-applied here). Best-effort.
-      if (config.webhook_url) {
-        await this.postWebhook(config.webhook_url, summary);
-      }
+      const event =
+        existing.length === 0
+          ? this.appendEvent(-1, "", raw, 0)
+          : null;
+
+      this.ctx.storage.sql.exec(
+        `UPDATE jobs
+         SET status = ?,
+             final_status = ?,
+             finalization_state = ?,
+             finalization_error = ?
+         WHERE id = ?`,
+        finalStatus,
+        finalStatus,
+        state,
+        finalizationError,
+        jobId
+      );
+
+      return event;
+    });
+
+    if (appended) {
+      this.broadcast(jobId, appended.envelope, appended.seq);
     }
+  }
 
-    // Terminal event (pdf_index -1 = job-level, filename "").
-    this.emit(jobId, -1, "", {
-      event: "job_done",
-      status: finalStatus,
-      total_pdfs: total,
-      completed_pdfs: job?.completed_pdfs ?? 0,
-      failed_pdfs: failed,
+  /**
+   * Run or resume the prepare -> aggregate -> library -> cohort -> webhook ->
+   * terminal state machine. Every completed-work marker is written only after
+   * its side effect has committed.
+   */
+  private async finalizeJob(jobId: string, config: JobConfig): Promise<void> {
+    let stage = "prepare";
+    try {
+      this.prepareFinalization(jobId);
+
+      stage = "configuration";
+      this.validateFinalizationConfig(config);
+
+      const data = this.readFinalizationData(jobId, config);
+      let state = data.state;
+      if (state === "terminal_committed" || state === "abandoned") return;
+
+      if (state === "prepared") {
+        stage = "aggregate";
+        await this.env.RESULT_BUCKET.put(
+          `results/${jobId}.json`,
+          JSON.stringify(data.results),
+          { httpMetadata: { contentType: "application/json" } }
+        );
+        this.advanceFinalization(
+          jobId,
+          "prepared",
+          "aggregate_committed"
+        );
+        state = "aggregate_committed";
+      }
+
+      if (state === "aggregate_committed") {
+        stage = "library";
+        await this.persistFinalizationLibrary(jobId, config, data);
+        this.advanceFinalization(
+          jobId,
+          "aggregate_committed",
+          "library_committed"
+        );
+        state = "library_committed";
+      }
+
+      if (state === "library_committed") {
+        stage = "cohort";
+        await this.persistCohortStage(jobId, config, data);
+        this.advanceFinalization(
+          jobId,
+          "library_committed",
+          "cohort_committed"
+        );
+        state = "cohort_committed";
+      }
+
+      if (state === "cohort_committed") {
+        stage = "webhook";
+        if (config.webhook_url) {
+          if (!config.run_id) {
+            throw new Error(
+              "finalization invariant: webhook has no run_id"
+            );
+          }
+          const summary = this.cohortSummary(jobId, config, data);
+          await this.postWebhook(
+            config.webhook_url,
+            summary,
+            config.run_id
+          );
+        }
+        this.advanceFinalization(
+          jobId,
+          "cohort_committed",
+          "webhook_committed"
+        );
+        state = "webhook_committed";
+      }
+
+      if (state === "webhook_committed") {
+        stage = "terminal";
+        const terminal: Record<string, unknown> = {
+          event: "job_done",
+          status: data.finalStatus,
+          total_pdfs: data.job.total_pdfs,
+          completed_pdfs: data.job.completed_pdfs,
+          failed_pdfs: data.job.failed_pdfs,
+        };
+        if (data.processingAbandoned) {
+          terminal.abandoned = true;
+        }
+        this.commitTerminal(
+          jobId,
+          data.finalStatus,
+          terminal,
+          "terminal_committed",
+          data.processingAbandoned ? PROCESSING_ABANDONED : null,
+          "webhook_committed"
+        );
+      }
+    } catch (error) {
+      try {
+        this.recordFinalizationFailure(jobId, stage, error);
+      } catch (diagnosticError) {
+        console.error(
+          "could not persist finalization diagnostic:",
+          diagnosticError
+        );
+      }
+      void this.ctx.storage.setAlarm(Date.now() + WATCHDOG_MS);
+      throw error;
+    }
+  }
+
+  /**
+   * Mark every non-terminal PDF failed, recompute job counters from the source
+   * rows, and persist the abandonment marker atomically.
+   */
+  private markRemainingPdfsFailed(
+    jobId: string,
+    pdfError: string,
+    jobMarker: string
+  ): void {
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec(
+        `UPDATE job_pdfs
+         SET status = 'failed',
+             error = COALESCE(error, ?)
+         WHERE status NOT IN ('complete','failed')`,
+        pdfError
+      );
+
+      const counts = this.ctx.storage.sql
+        .exec<{
+          completed: number;
+          failed: number;
+        }>(
+          `SELECT
+             SUM(CASE WHEN status = 'complete' THEN 1 ELSE 0 END) AS completed,
+             SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed
+           FROM job_pdfs`
+        )
+        .toArray()[0];
+
+      this.ctx.storage.sql.exec(
+        `UPDATE jobs
+         SET completed_pdfs = ?,
+             failed_pdfs = ?,
+             finalization_error = ?
+         WHERE id = ?`,
+        counts?.completed ?? 0,
+        counts?.failed ?? 0,
+        jobMarker,
+        jobId
+      );
     });
   }
 
   /**
-   * Best-effort, SSRF-guarded webhook POST (cohort run finalize). The URL was
-   * validated when the cohort was saved/patched, but we RE-VALIDATE here (https
-   * only; reject loopback / private / link-local / metadata hosts) because the DO
-   * is the actual egress point. ANY failure (bad URL, network error, non-2xx) is
-   * swallowed — a webhook problem must never fail the job. A short timeout keeps a
-   * slow/hung endpoint from holding the DO open.
+   * Finalization exceeded its own retry ceiling. Guarantee a failed terminal
+   * event even if external finalization gates remain unavailable. Preserve an
+   * existing aggregate; otherwise attempt the pinned empty-partial document.
    */
-  private async postWebhook(
-    webhookUrl: string,
-    summary: unknown
+  private async forceFinalizationAbandonment(
+    jobId: string,
+    config: JobConfig
   ): Promise<void> {
-    const verdict = validateWebhookUrl(webhookUrl);
-    if ("error" in verdict) {
-      console.error("cohort webhook rejected by SSRF guard:", verdict.error);
-      return;
-    }
+    this.markRemainingPdfsFailed(
+      jobId,
+      "abandoned: finalization never completed",
+      FINALIZATION_ABANDONED
+    );
+
+    const jobRows = this.ctx.storage.sql
+      .exec<FinalizationJobRow>(
+        `SELECT id, status, created_at, total_pdfs, completed_pdfs,
+                failed_pdfs, config_json, finalization_state, final_status,
+                finalized_at, finalization_error
+         FROM jobs WHERE id = ?`,
+        jobId
+      )
+      .toArray();
+    if (jobRows.length === 0) return;
+    const job = jobRows[0];
+    const finalizedAt = job.finalized_at ?? Date.now();
+
+    this.ctx.storage.sql.exec(
+      `UPDATE jobs
+       SET final_status = 'failed',
+           finalized_at = ?,
+           finalization_error = ?
+       WHERE id = ?`,
+      finalizedAt,
+      FINALIZATION_ABANDONED,
+      jobId
+    );
+
+    const pdfRows = this.ctx.storage.sql
+      .exec<FinalizationPdfRow>(
+        `SELECT pdf_index, filename, status, attempt, results, error,
+                file_sha256
+         FROM job_pdfs
+         ORDER BY pdf_index`
+      )
+      .toArray();
+
+    const emptyPartial: JobResults = {
+      jobId,
+      created_at: job.created_at,
+      finished_at: finalizedAt,
+      config: {
+        brands: config.brands,
+        runs: config.runs,
+        explain: config.explain,
+      },
+      pdfs: pdfRows.map((pdf) => ({
+        index: pdf.pdf_index,
+        filename: pdf.filename,
+        status: pdf.status as JobStatus,
+        error: pdf.error ?? undefined,
+        results: [],
+        errors: [],
+      })),
+    };
+
+    const resultKey = `results/${jobId}.json`;
+    let resultsAvailable = false;
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 10_000);
-      try {
-        await fetch(verdict.url, {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            // Make redirects a no-op so the validated host is the ONLY target;
-            // a 30x to an internal host can never be silently followed.
-            "user-agent": "pa-policy-extractor-cohort-webhook/1",
-          },
-          body: JSON.stringify(summary),
-          redirect: "manual",
-          signal: controller.signal,
-        });
-      } finally {
-        clearTimeout(timer);
-      }
-    } catch (err) {
-      console.error("cohort webhook POST failed (ignored):", err);
+      resultsAvailable = Boolean(
+        await this.env.RESULT_BUCKET.head(resultKey)
+      );
+    } catch (error) {
+      console.error(
+        `finalization abandonment aggregate check failed: ${sanitizeFinalizationError(error)}`
+      );
     }
+
+    if (!resultsAvailable) {
+      try {
+        await this.env.RESULT_BUCKET.put(
+          resultKey,
+          JSON.stringify(emptyPartial),
+          { httpMetadata: { contentType: "application/json" } }
+        );
+        resultsAvailable = true;
+      } catch (error) {
+        console.error(
+          `finalization abandonment aggregate write failed: ${sanitizeFinalizationError(error)}`
+        );
+      }
+    }
+
+    const refreshed = this.ctx.storage.sql
+      .exec<{
+        total_pdfs: number;
+        completed_pdfs: number;
+        failed_pdfs: number;
+      }>(
+        `SELECT total_pdfs, completed_pdfs, failed_pdfs
+         FROM jobs WHERE id = ?`,
+        jobId
+      )
+      .toArray()[0];
+
+    this.commitTerminal(
+      jobId,
+      "failed",
+      {
+        event: "job_done",
+        status: "failed",
+        total_pdfs: refreshed?.total_pdfs ?? job.total_pdfs,
+        completed_pdfs:
+          refreshed?.completed_pdfs ?? job.completed_pdfs,
+        failed_pdfs: refreshed?.failed_pdfs ?? job.failed_pdfs,
+        abandoned: true,
+        results_available: resultsAvailable,
+      },
+      "abandoned",
+      FINALIZATION_ABANDONED
+    );
   }
 
   // ── GET /state (poll) ───────────────────────────────────────────────────────
@@ -1052,15 +1847,7 @@ export class JobCoordinator extends DurableObject<Env> {
     const sql = this.ctx.storage.sql;
 
     const jobRows = sql
-      .exec<{
-        id: string;
-        status: string;
-        created_at: number;
-        total_pdfs: number;
-        completed_pdfs: number;
-        failed_pdfs: number;
-        config_json: string;
-      }>("SELECT * FROM jobs LIMIT 1")
+      .exec<FinalizationJobRow>("SELECT * FROM jobs LIMIT 1")
       .toArray();
 
     if (jobRows.length === 0) {
@@ -1072,10 +1859,8 @@ export class JobCoordinator extends DurableObject<Env> {
     const job = jobRows[0];
     const config = JSON.parse(job.config_json) as JobConfig;
 
-    // Poll-triggered self-heal: if the job is non-terminal but no processing
-    // run is alive in this instance (orphaned by a DO restart), pull the
-    // watchdog alarm forward so recovery starts in seconds, not minutes —
-    // someone polling a stuck job is exactly the moment to fix it.
+    // Poll-triggered self-heal applies equally to extraction and persisted
+    // finalization stages.
     if (
       job.status !== "complete" &&
       job.status !== "failed" &&
@@ -1089,10 +1874,11 @@ export class JobCoordinator extends DurableObject<Env> {
         pdf_index: number;
         filename: string;
         status: string;
+        attempt: number;
         results: number;
         error: string | null;
       }>(
-        "SELECT pdf_index, filename, status, results, error FROM job_pdfs ORDER BY pdf_index"
+        "SELECT pdf_index, filename, status, attempt, results, error FROM job_pdfs ORDER BY pdf_index"
       )
       .toArray();
 
@@ -1116,12 +1902,25 @@ export class JobCoordinator extends DurableObject<Env> {
         index: p.pdf_index,
         filename: p.filename,
         status: p.status as JobStatus,
+        attempt: p.attempt,
         results: p.results,
         error: p.error ?? undefined,
       })),
       last_seq: lastSeq,
       created_at: job.created_at,
     };
+
+    const finalizationState = parseFinalizationState(
+      job.finalization_state
+    );
+    if (finalizationState !== "none") {
+      state.finalize_state = finalizationState;
+    }
+    if (job.finalization_error) {
+      state.finalize_error = sanitizeFinalizationError(
+        job.finalization_error
+      );
+    }
 
     return new Response(JSON.stringify(state), {
       headers: { "content-type": "application/json" },
@@ -1245,13 +2044,9 @@ export class JobCoordinator extends DurableObject<Env> {
   /**
    * One alarm slot, two duties.
    *
-   * NON-TERMINAL job: this is the WATCHDOG. Processing rides a waitUntil
-   * promise that a DO restart silently orphans (observed live: status
-   * "running", PDF "pending", forever). If no processing run is alive in this
-   * instance, resume it (resetting orphaned per-PDF counters so re-streamed
-   * results don't double-count); past MAX_JOB_AGE_MS, abandon to a terminal
-   * failed state instead. Either way, re-arm the watchdog — runJob hands the
-   * slot to retention when the job lands terminal.
+   * NON-TERMINAL job: resume orphaned extraction or finalization. Processing
+   * abandonment marks unfinished PDFs failed and enters the normal hard-gated
+   * finalizer. Finalization exhaustion uses the forced-failed fallback.
    *
    * TERMINAL job: retention. Before the retention timestamp, just re-arm for
    * it (covers legacy alarms and watchdog->retention handoff races); after it,
@@ -1261,14 +2056,11 @@ export class JobCoordinator extends DurableObject<Env> {
   override async alarm(): Promise<void> {
     try {
       const jobRows = this.ctx.storage.sql
-        .exec<{
-          id: string;
-          total_pdfs: number;
-          status: string;
-          created_at: number;
-          config_json: string;
-        }>(
-          "SELECT id, total_pdfs, status, created_at, config_json FROM jobs LIMIT 1"
+        .exec<FinalizationJobRow>(
+          `SELECT id, status, created_at, total_pdfs, completed_pdfs,
+                  failed_pdfs, config_json, finalization_state, final_status,
+                  finalized_at, finalization_error
+           FROM jobs LIMIT 1`
         )
         .toArray();
 
@@ -1276,41 +2068,100 @@ export class JobCoordinator extends DurableObject<Env> {
         // Already cleaned up — nothing to do.
         return;
       }
-      const { id: jobId, total_pdfs } = jobRows[0];
-      const row = jobRows[0];
 
-      const isTerminal = row.status === "complete" || row.status === "failed";
+      const row = jobRows[0];
+      const jobId = row.id;
+      const config = JSON.parse(row.config_json) as JobConfig;
+      const isTerminal =
+        row.status === "complete" || row.status === "failed";
+
       if (!isTerminal) {
         if (!this.processing) {
-          if (Date.now() - row.created_at > MAX_JOB_AGE_MS) {
-            // Abandon: repeated resurrection never converged. Terminal state so
-            // pollers stop seeing an eternal "running".
-            this.ctx.storage.sql.exec(
-              "UPDATE jobs SET status = 'failed' WHERE id = ?",
-              jobId
+          const finalizationState = parseFinalizationState(
+            row.finalization_state
+          );
+
+          if (finalizationState !== "none") {
+            const startedAt = row.finalized_at ?? row.created_at;
+            if (Date.now() - startedAt > MAX_JOB_AGE_MS) {
+              await this.forceFinalizationAbandonment(jobId, config);
+              this.scheduleRetention(row.created_at);
+              return;
+            }
+
+            console.log(
+              `watchdog: resuming finalization for job ${jobId}`
             );
-            this.ctx.storage.sql.exec(
-              "UPDATE job_pdfs SET status = 'failed', error = COALESCE(error, 'abandoned: job never completed (instance churn)') WHERE status NOT IN ('complete','failed')"
+            this.ctx.waitUntil(this.runJob(jobId, config));
+          } else if (Date.now() - row.created_at > MAX_JOB_AGE_MS) {
+            // Processing-time abandonment is not terminal by itself. Mark the
+            // unfinished PDFs failed, sync counters, and enter the same
+            // hard-gated finalizer used by a normally completed extraction.
+            this.markRemainingPdfsFailed(
+              jobId,
+              "abandoned: job never completed (instance churn)",
+              PROCESSING_ABANDONED
             );
+            this.ctx.waitUntil(this.runJob(jobId, config));
           } else {
-            // Orphaned processing — resume. Reset the counters of every
-            // non-terminal PDF first: a partially-streamed PDF re-runs from
-            // scratch, and its prior `result` events must not double-count.
+            // Orphaned processing: atomically bump each non-terminal attempt,
+            // reset its state, and append the ordered pdf_reset event. Terminal
+            // PDFs are excluded, so the all-terminal crash-before-finalize case
+            // performs zero resets and zero attempt bumps.
             console.log(`watchdog: resuming orphaned job ${jobId}`);
-            this.ctx.storage.sql.exec(
-              "UPDATE job_pdfs SET results = 0, error = NULL WHERE status NOT IN ('complete','failed')"
-            );
-            const config = JSON.parse(row.config_json) as JobConfig;
+            const resetEvents = this.ctx.storage.transactionSync(() => {
+              const resetRows = this.ctx.storage.sql
+                .exec<{
+                  pdf_index: number;
+                  filename: string;
+                  attempt: number;
+                }>(
+                  `UPDATE job_pdfs
+                   SET attempt = attempt + 1,
+                       status = 'pending',
+                       results = 0,
+                       error = NULL
+                   WHERE status NOT IN ('complete','failed')
+                   RETURNING pdf_index, filename, attempt`
+                )
+                .toArray();
+
+              const appended: { envelope: JobEvent; seq: number }[] = [];
+              for (const reset of resetRows) {
+                appended.push(
+                  this.appendEvent(
+                    reset.pdf_index,
+                    reset.filename,
+                    {
+                      event: "pdf_reset",
+                      reason: "watchdog_resume",
+                      previous_attempt: reset.attempt - 1,
+                      attempt: reset.attempt,
+                    },
+                    reset.attempt
+                  )
+                );
+              }
+              return appended;
+            });
+
+            // Output only after the reset rows and reset events have committed.
+            for (const event of resetEvents) {
+              this.broadcast(jobId, event.envelope, event.seq);
+            }
+
             this.ctx.waitUntil(this.runJob(jobId, config));
           }
         }
+
         void this.ctx.storage.setAlarm(Date.now() + WATCHDOG_MS);
         return;
       }
 
       // Terminal: retention duty. Not yet due -> re-arm for the real deadline.
       const retentionDays = Number(this.env.RETENTION_DAYS ?? "7") || 7;
-      const retentionAt = row.created_at + retentionDays * 24 * 60 * 60 * 1000;
+      const retentionAt =
+        row.created_at + retentionDays * 24 * 60 * 60 * 1000;
       if (Date.now() < retentionAt) {
         void this.ctx.storage.setAlarm(retentionAt);
         return;
@@ -1319,7 +2170,7 @@ export class JobCoordinator extends DurableObject<Env> {
       // Delete every staged PDF and the results doc from R2. R2 delete on a
       // missing key is a no-op, so re-running is safe.
       const keys: string[] = [`results/${jobId}.json`];
-      for (let i = 0; i < total_pdfs; i++) {
+      for (let i = 0; i < row.total_pdfs; i++) {
         keys.push(`pdfs/${jobId}/${i}.pdf`);
       }
       await this.env.RESULT_BUCKET.delete(keys);
@@ -1329,8 +2180,8 @@ export class JobCoordinator extends DurableObject<Env> {
       await this.ctx.storage.deleteAll();
     } catch (err) {
       // Idempotency: on ANY failure, reschedule the alarm to retry shortly so
-      // we never leak R2 objects. (Re-running is safe; deletes are no-ops.)
-      console.error("retention alarm failed; rescheduling:", err);
+      // we never leak R2 objects or strand a non-terminal finalization.
+      console.error("job alarm failed; rescheduling:", err);
       void this.ctx.storage.setAlarm(Date.now() + 60 * 60 * 1000); // +1h
     }
   }
