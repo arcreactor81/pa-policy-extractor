@@ -4,6 +4,18 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-06-01",
 
+  // Keep the Worker OFF its public *.workers.dev hostname. Access is enforced at
+  // the edge on the custom domain (<custom-domain>); an
+  // Access application is bound to a HOSTNAME, so a live workers.dev hostname is
+  // a second front door that the policy does not cover.
+  //
+  // This is declared here rather than toggled in the dashboard because a toggle
+  // does not survive: the subdomain was disabled on 2026-08-02, and the very
+  // next `wrangler deploy` turned it back on (verified — enabled flipped
+  // false -> true across the deploy). Omitting this field lets every deploy
+  // re-open the hostname silently. See docs/CONTAINERS-OFFLINE.md §3 item 5.
+  "workers_dev": false,
+
   // ─── CONTAINER DISABLED, 2 AUGUST 2026 ───────────────────────────────────
   //
   // The container application `pa-policy-extractor-pacontainer` (id

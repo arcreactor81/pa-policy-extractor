@@ -202,7 +202,7 @@ browsing and diffs, `GET /api/brands`, and reading any existing job or result.
 | 2 | `max_instances: 3` → `1` | VERIFIED | one line | **Blocker** |
 | 3 | The alarm loop | VERIFIED — *the cause* | real work | **Blocker** |
 | 4 | `enforceRateLimit` fails open | VERIFIED | ~10 lines | **Blocker** (spending routes) |
-| 5 | `workers.dev` exposure | mitigated; history unverified | minutes | Advisable |
+| 5 | `workers.dev` exposure | **VERIFIED — deploys re-open it** | one line | **Blocker** |
 | 6 | In-app Access verification | VERIFIED gap | ~1 hour | Advisable |
 
 ### 1. Set a hard spend cap on the AI Gateway — **blocker**
@@ -300,41 +300,57 @@ Fix: fail **closed** (503 + `Retry-After`) on the LLM-spending routes; keep
 fail-open, if you want it, for the cheap read routes. Ten lines, and it removes a
 failure mode where a DO wobble turns into an unbounded spend window.
 
-### 5. `workers.dev` exposure — advisable; **history genuinely unverified**
+### 5. `workers.dev` exposure — **blocker; a deploy silently re-opens it**
 
 The concern as raised: the Worker may still be reachable on a public
 `workers.dev` hostname where **edge Access does not apply**, which would expose
 `/api/analyze`, `/api/extract` and `/api/ask` — routes that proxy to a container
 holding provider credentials and can spend up to `MAX_LLM_CALLS = 200` per PDF.
 
-What is **VERIFIED**, as of 2026-08-02:
+This started as an open question. It is no longer one.
 
-- The `workers.dev` subdomain for this Worker is **currently disabled**
-  (`{"enabled": false, "previews_enabled": false}`). The concern is closed *right
-  now*.
-- It was **not** disabled during the observed window. Every inbound request in the
-  logs — both crawler hits and the 1 August browser page load — arrived at
-  `https://pa-policy-extractor.<subdomain>.workers.dev/…` and returned `200`.
-  The hostname was live and publicly reachable at least until **1 August 05:12
-  UTC**. Access was configured on the custom domain around **1–2 August** —
-  *after* the 28 July crawl. (The exact cutover time was not independently
-  confirmed here; the reachability evidence above is from the Worker's own logs.)
+**VERIFIED, 2026-08-02 — a routine `wrangler deploy` re-enables the hostname.**
+The subdomain was confirmed **disabled** (`{"enabled": false, "previews_enabled":
+false}`) before the shutdown commit. The deploy that shipped that commit — which
+changed nothing about routing — flipped it back to `{"enabled": true,
+"previews_enabled": true}`. Checked immediately before and immediately after. A
+dashboard toggle does not survive a deploy, because `workers_dev` was simply
+absent from `wrangler.jsonc` and wrangler defaults it on.
+
+**Fix (applied):** `"workers_dev": false` is now declared in `wrangler.jsonc`, so
+the setting is enforced by every deploy instead of being undone by it. This is
+the difference between a control and a good intention.
+
+Also **VERIFIED**:
+
+- The hostname was live and publicly reachable during the observed window. Every
+  inbound request in the logs — both crawler hits and the 1 August browser page
+  load — arrived at `https://pa-policy-extractor.<subdomain>.workers.dev/…` and
+  returned `200`, at least until **1 August 05:12 UTC**. Access was configured on
+  the custom domain around **1–2 August** — *after* the 28 July crawl. (The exact
+  cutover time was not independently confirmed here; the reachability evidence is
+  from the Worker's own logs.)
 - Edge enforcement **is** live on the custom domain
   `<custom-domain>` via the Access application.
 
-What remains **UNVERIFIED**, and should be written as an open question rather
-than a finding:
+What remains **UNVERIFIED**, and should be read as an open question rather than a
+finding:
 
 - Whether the `workers.dev` hostname actually bypassed Access while it was
-  enabled. It is *likely* — Access applications are configured per hostname, and
-  this one names the custom domain — but it was never tested against the live
-  endpoint, and it cannot be tested now that the subdomain is off.
+  enabled. It is *likely* — Access applications are bound to a hostname, and this
+  one names the custom domain — but it was never tested against the live endpoint
+  while both were up.
 - Whether anything was ever abused through it. The evidence is reassuring but not
   proof: all six logged requests are static-asset GETs and none is an `/api/*`
-  route. Worker logs are sampled and retained ~7 days, so this covers the window
-  and no further back.
+  route. Worker logs are sampled and retained ~7 days, so this covers the observed
+  window and no further back.
 
-The check to run, **after any restore**:
+Note the current blast radius, for proportion: with `CONTAINERS_OFFLINE` set,
+`/api/analyze` and `/api/extract` cannot spend anything — they refuse before
+reaching the container. **`/api/ask` still spends** (Workers AI + AI Search) and
+is not container-backed, so it is the route that matters most here.
+
+The check to run, **after every deploy** — not just after a restore:
 
 ```bash
 # 1. Is the workers.dev hostname enabled at all?
@@ -349,10 +365,11 @@ curl -sS -o /dev/null -w '%{http_code} %{redirect_url}\n' \
 # apply to that hostname, and every /api/* route is open there.
 ```
 
-Standing recommendation: **keep the `workers.dev` subdomain disabled**, and make
-that assertion a post-deploy check rather than a thing someone remembers. It is a
-single toggle, and a deploy or a dashboard click can flip it back without anyone
-noticing.
+Standing recommendation: keep `"workers_dev": false` in `wrangler.jsonc`, and
+make the assertion above a **post-deploy check** rather than something someone
+remembers. The general lesson is worth more than the specific setting: **a
+security control that lives only in the dashboard is one deploy away from being
+gone**, and nothing will tell you.
 
 ### 6. In-app Access verification authenticates nothing — advisable
 
