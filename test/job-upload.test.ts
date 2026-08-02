@@ -6,10 +6,30 @@ import {
   runInDurableObject,
   waitOnExecutionContext,
 } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import worker from "../src/index";
 import { JobCoordinator } from "../src/job-coordinator";
 import type { Env } from "../worker-configuration";
+
+/**
+ * Container offline switch (2026-08-02). The deployed default is
+ * CONTAINERS_OFFLINE="1" (wrangler.jsonc), which makes the whole /api/jobs
+ * staging + creation family answer 503 before it validates anything — see
+ * docs/CONTAINERS-OFFLINE.md.
+ *
+ * Everything in THIS file covers the staged-upload and multipart validation
+ * layer: manifest bounds, declared-vs-actual length, PDF magic bytes, marker
+ * ownership, R2 residue, idempotency. None of that depends on a container
+ * existing, and all of it must keep working when the container comes back, so
+ * the suite turns the switch off for its duration. The offline refusal itself
+ * is asserted in worker.test.ts.
+ */
+beforeAll(() => {
+  (env as unknown as { CONTAINERS_OFFLINE?: string }).CONTAINERS_OFFLINE = "0";
+});
+afterAll(() => {
+  (env as unknown as { CONTAINERS_OFFLINE?: string }).CONTAINERS_OFFLINE = "1";
+});
 
 const OWNER_HEADER = "cf-access-authenticated-user-email";
 const MAX_FILE_BYTES = 20 * 1024 * 1024;

@@ -2715,3 +2715,115 @@ body.cohorts-active .lib-analyses-view { display: none !important; }
   border: 1px solid color-mix(in srgb, var(--amber) 35%, var(--border));
   font-size: .85rem; line-height: 1.5;
 }
+
+/* =========================================================================
+   SERVICE NOTICE — container shut down, 2 August 2026
+   -------------------------------------------------------------------------
+   PDF extraction is offline (docs/CONTAINERS-OFFLINE.md). This is the first
+   block inside <main>. It reuses the page's existing vocabulary — the .panel
+   shape, the amber tokens already used by .dz-bigfile-note, the mono kicker of
+   .field-label and the serif of .panel-title — so it reads as part of the
+   design rather than an injected alert. No new colours, fonts or shadows are
+   introduced, and both themes are covered because every value below is a token
+   that already flips with the theme.
+
+   Also here: the disabled state for the container-backed controls that
+   /offline.js locks down.
+
+   TO RESTORE: delete this whole block, the <section class="offline-notice"> in
+   index.html, and public/offline.js.
+   ========================================================================= */
+.offline-notice {
+  position: relative;
+  margin-top: 1.4rem;
+  padding: 1.25rem 1.4rem;
+  border-radius: var(--radius);
+  background: var(--amber-soft);
+  border: 1px solid color-mix(in srgb, var(--amber) 42%, var(--border));
+  box-shadow: var(--shadow);
+  color: var(--amber-text);
+}
+/* Left rule: the one piece of emphasis, so the notice reads as a standing
+   condition rather than a dismissible toast. */
+.offline-notice::after {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 3px;
+  border-radius: var(--radius) 0 0 var(--radius);
+  background: var(--amber);
+}
+.offline-notice__kicker {
+  margin: 0 0 .3rem;
+  font-family: var(--mono);
+  font-size: .68rem;
+  text-transform: uppercase;
+  letter-spacing: .14em;
+  opacity: .85;
+}
+.offline-notice__title {
+  margin: 0 0 .5rem;
+  font-family: var(--serif);
+  font-weight: 400;
+  font-size: 1.45rem;
+  line-height: 1.2;
+  letter-spacing: -.01em;
+  color: var(--amber-text);
+}
+.offline-notice__lede {
+  margin: 0;
+  font-size: .92rem;
+  line-height: 1.6;
+  max-width: 78ch;
+}
+.offline-notice__cols {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1.1rem 1.8rem;
+  margin-top: 1.1rem;
+  padding-top: 1rem;
+  border-top: 1px solid color-mix(in srgb, var(--amber) 30%, transparent);
+}
+@media (max-width: 720px) { .offline-notice__cols { grid-template-columns: 1fr; } }
+.offline-notice__coltitle {
+  margin: 0 0 .45rem;
+  font-family: var(--mono);
+  font-size: .68rem;
+  text-transform: uppercase;
+  letter-spacing: .14em;
+}
+.offline-notice__coltitle--ok { color: var(--green-text); }
+.offline-notice__coltitle--off { color: var(--red-text); }
+.offline-notice__list {
+  margin: 0;
+  padding-left: 1.1rem;
+  font-size: .87rem;
+  line-height: 1.65;
+}
+.offline-notice__list li { margin: 0; }
+.offline-notice__note {
+  margin: .55rem 0 0;
+  font-size: .82rem;
+  line-height: 1.55;
+  opacity: .8;
+}
+.offline-notice__foot {
+  margin: 1rem 0 0;
+  font-size: .82rem;
+  line-height: 1.55;
+  opacity: .85;
+}
+.offline-notice__foot code {
+  font-family: var(--mono);
+  font-size: .95em;
+}
+
+/* Controls whose only destination is the container. /offline.js pins these
+   disabled and gives each an explanatory title; this makes the state legible
+   instead of looking like a button that simply has not loaded yet. */
+.is-container-offline[disabled],
+.is-container-offline:disabled {
+  cursor: not-allowed;
+  opacity: .5;
+  filter: grayscale(1);
+}

@@ -14,6 +14,69 @@
  * Nothing here touches a binding or env directly; callers pass what they need.
  */
 
+// ── container offline switch (2026-08-02) ─────────────────────────────────────
+//
+// The `pa-policy-extractor-pacontainer` container application (id
+// <container-application-id>, version 15) was DELETED on 2 August 2026
+// because it billed wall-clock time in an idle, self-rearming Durable Object
+// alarm loop — 180,004 ms of wall time against 0 ms of CPU, repeatedly, while
+// serving no traffic. Full root cause, the exact deleted configuration, the
+// restore steps and the fix-before-restore list live in
+// docs/CONTAINERS-OFFLINE.md.
+//
+// The `containers` block in wrangler.jsonc is commented out to match, but the
+// PaContainer Durable Object CLASS is still bound (the binding, the migration
+// tag and the class export all remain). @cloudflare/containers throws
+// "Containers have not been enabled for this Durable Object class" from its
+// CONSTRUCTOR when `ctx.container` is undefined, so merely CONSTRUCTING the DO
+// while the container application is gone surfaces as an opaque runtime
+// exception to the browser. Every code path that would reach
+// `getContainer(env.PA_CONTAINER, ...)` therefore checks this flag FIRST and
+// answers with a human sentence instead.
+//
+// The switch is a VAR (`CONTAINERS_OFFLINE` in wrangler.jsonc), not a source
+// constant, for three reasons: restoring is a config flip plus a redeploy
+// rather than a code edit; the container-backed code paths stay reachable to
+// the typechecker and to the test suite (which turns the switch off to exercise
+// the upload/validation contracts that are independent of the container); and
+// an operator can take the container offline again in an emergency without a
+// build.
+//
+// It DEFAULTS TO OFFLINE when the var is absent. That is the fail-safe
+// direction: forgetting the var can only leave extraction switched off, never
+// silently resurrect a fleet that bills 12 vCPU / 36 GiB to serve nothing.
+//
+// TO RESTORE: fix the alarm loop, redeploy the container application, uncomment
+// the `containers` block in wrangler.jsonc, then set CONTAINERS_OFFLINE to "0".
+// All four steps — see docs/CONTAINERS-OFFLINE.md.
+
+/** Strings that explicitly turn the offline switch OFF (i.e. container live). */
+const CONTAINERS_ONLINE_VALUES = new Set(["0", "false", "no", "off", "n", "f"]);
+
+/**
+ * True while the container application is deleted and every container-backed
+ * route must refuse. Reads `env.CONTAINERS_OFFLINE`; absent or unrecognised
+ * means OFFLINE (fail safe).
+ */
+export function containersOffline(env: {
+  CONTAINERS_OFFLINE?: string;
+}): boolean {
+  const raw = env.CONTAINERS_OFFLINE?.trim().toLowerCase();
+  if (raw === undefined || raw === "") return true;
+  return !CONTAINERS_ONLINE_VALUES.has(raw);
+}
+
+/**
+ * The single human sentence every container-backed route answers with while
+ * CONTAINERS_OFFLINE is set. Deliberately plain: it says what is unavailable,
+ * that it was a decision rather than a fault, and where to read the detail.
+ */
+export const CONTAINERS_OFFLINE_MESSAGE =
+  "PDF extraction is offline — the container has been shut down to stop it " +
+  "billing idle wall-clock time. This is a deliberate cost decision, not an " +
+  "outage: the saved analyses, library, export and Ask features still work. " +
+  "See README (“Status”) and docs/CONTAINERS-OFFLINE.md.";
+
 // ── runs / explain parsers (shared) ───────────────────────────────────────────
 
 /** Truthy string forms accepted for a boolean flag (explain / schedule_enabled). */

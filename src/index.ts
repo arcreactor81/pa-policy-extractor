@@ -52,7 +52,13 @@ import {
   handleWebCheckStatus,
 } from "./web-check";
 import { handleAsk, handleKnowledgeBackfill } from "./knowledge";
-import { clampRuns, parseBrandsCsv, parseExplain } from "./util";
+import {
+  CONTAINERS_OFFLINE_MESSAGE,
+  clampRuns,
+  parseBrandsCsv,
+  containersOffline,
+  parseExplain,
+} from "./util";
 
 // Re-export the RateLimiter DO so wrangler can bind the class from src/index.ts
 // (the configured `main`). The implementation lives in ./rate-limiter.
@@ -285,6 +291,27 @@ function empty(status = 204): Response {
 }
 
 /**
+ * The answer every container-backed route gives while the container application
+ * is deleted (see CONTAINERS_OFFLINE in ./util).
+ *
+ * 503 + Retry-After is the honest status: the capability is deliberately
+ * withdrawn and is expected to come back once the alarm-loop bug is fixed. The
+ * `x-pa-containers-offline` header lets a client (or a curl check) distinguish
+ * "switched off on purpose" from "the container crashed", which a bare 502
+ * cannot express. Retry-After is a day: there is no point in a client retrying
+ * sooner, because nothing is coming back without a redeploy.
+ */
+function containersOfflineResponse(): Response {
+  const res = json(
+    { error: CONTAINERS_OFFLINE_MESSAGE } satisfies ErrorResponse,
+    503
+  );
+  res.headers.set("retry-after", "86400");
+  res.headers.set("x-pa-containers-offline", "1");
+  return res;
+}
+
+/**
  * Proxy a request to the container at `path`. The original request is streamed
  * through unchanged (method + headers + body) by re-pointing its URL at the
  * container path â€” we never re-parse the multipart body. `instanceName`
@@ -297,6 +324,15 @@ async function proxyToContainer(
   request: Request,
   instanceName: string
 ): Promise<Response> {
+  // Container offline (2026-08-02, see ./util) — LAST-LINE guard. Every caller
+  // below also checks CONTAINERS_OFFLINE up front and returns a route-shaped
+  // answer; this catch-all exists so that no future route can reach
+  // getContainer() and blow up in the @cloudflare/containers constructor with
+  // "Containers have not been enabled for this Durable Object class".
+  if (containersOffline(env)) {
+    return containersOfflineResponse();
+  }
+
   const containerUrl = new URL(path, "http://c").toString();
   const proxied = new Request(containerUrl, request);
   const instance = getContainer(env.PA_CONTAINER, instanceName);
@@ -1670,6 +1706,13 @@ async function handleCohortRoutes(
       );
     }
     // A run stages PDFs into a new job (container work) â€” rate-limit it.
+    // Container offline (2026-08-02): a cohort run IS a batch job, so it can do
+    // nothing while the container is gone. Browsing cohorts, their past runs and
+    // the run-to-run diff (/runs, /compare) still works — that data is already
+    // in D1 and R2.
+    if (containersOffline(env)) {
+      return containersOfflineResponse();
+    }
     const limited = await enforceRateLimit(env, request);
     if (limited) return limited;
     return handleCohortRun(env, owner, cohortId, json);
@@ -1748,6 +1791,22 @@ export default {
       if (request.method !== "GET" && request.method !== "HEAD") {
         return json({ error: "method not allowed" } satisfies ErrorResponse, 405);
       }
+      // Container offline (2026-08-02): answer the SAME typed HealthDownResponse
+      // the unreachable-container path already produces, so existing clients
+      // degrade exactly as they would for a container that failed to wake — but
+      // with a warm_error that says this was a decision, not a fault. Kept at
+      // 200 because that is this route's existing contract ("health must never
+      // throw"); `ok:false` is what carries the bad news.
+      if (containersOffline(env)) {
+        const down: HealthDownResponse = {
+          ok: false,
+          warm: false,
+          warm_error: CONTAINERS_OFFLINE_MESSAGE,
+        };
+        const res = json(down);
+        res.headers.set("x-pa-containers-offline", "1");
+        return res;
+      }
       try {
         // Health is cheap + read-only; route it to the fallback pool (no PDF
         // hash here) just to land on a warm instance.
@@ -1802,6 +1861,13 @@ export default {
             413
           );
         }
+      }
+
+      // Container offline (2026-08-02) — checked AFTER the method / rate-limit /
+      // size guards so those contracts are unchanged, and BEFORE the proxy so
+      // the client gets a sentence instead of a stalled NDJSON stream.
+      if (containersOffline(env)) {
+        return containersOfflineResponse();
       }
 
       try {
@@ -1862,6 +1928,11 @@ export default {
         }
       }
 
+      // Container offline (2026-08-02) — see the /api/analyze note above.
+      if (containersOffline(env)) {
+        return containersOfflineResponse();
+      }
+
       try {
         const res = await proxyToContainer(
           env,
@@ -1895,6 +1966,15 @@ export default {
       pathname === "/api/jobs/stage" ||
       pathname.startsWith("/api/jobs/stage/")
     ) {
+      // Container offline (2026-08-02): every staging sub-route (create session,
+      // PUT a file, start) exists only to feed a container job, so refuse at the
+      // FIRST call rather than letting someone upload 25 PDFs into R2 and fail
+      // at the start step. Reading an EXISTING job (/api/jobs/:id, its WebSocket
+      // stream and /api/results) is untouched — those are served from the DO and
+      // R2 and still work.
+      if (containersOffline(env)) {
+        return containersOfflineResponse();
+      }
       try {
         return await handleStageRoute(env, request, pathname);
       } catch (err) {
@@ -1916,6 +1996,12 @@ export default {
           { error: "method not allowed; use POST" } satisfies ErrorResponse,
           405
         );
+      }
+
+      // Container offline (2026-08-02): refuse before buffering a multipart body
+      // that can legally reach 100 MiB.
+      if (containersOffline(env)) {
+        return containersOfflineResponse();
       }
 
       const cap = jobUploadCap(env);
@@ -2323,6 +2409,15 @@ export default {
  * (no work, no container) when no cohort has opted in. Best-effort per cohort.
  */
 async function runScheduledCohorts(env: Env): Promise<void> {
+  // Container offline (2026-08-02): the daily cron must not stage container work
+  // it cannot run. This return also removes the one cron-driven way the alarm
+  // loop documented in docs/CONTAINERS-OFFLINE.md could be re-ignited without a
+  // human. (The `cohorts` table is empty in the live account as of 2026-08-02,
+  // so this path was already inert — but "empty today" is not a guarantee.)
+  // The library prune and staged-upload sweep in scheduled() are unaffected:
+  // they touch only D1 and R2 and never wake a container.
+  if (containersOffline(env)) return;
+
   // Ensure the cohort tables exist (lazy schema) before the SELECT, so a brand
   // new deployment with no cohorts yet doesn't error on a missing table.
   await ensureCohortSchema(env.LIBRARY);

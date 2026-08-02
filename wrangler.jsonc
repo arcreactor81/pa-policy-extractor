@@ -4,27 +4,55 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-06-01",
 
-  // The container running the Python extraction pipeline. standard-4 =
-  // 4 vCPU / 12 GiB / 20 GB disk — chosen for CPU OCR headroom.
-  "containers": [
-    {
-      "class_name": "PaContainer",
-      "image": "./container/Dockerfile",
-      "image_build_context": "./container",
-      "instance_type": "standard-4",
-      // Sticky-per-PDF routing fans distinct PDFs out across instances; capped
-      // at 3 to bound worst-case concurrent containers (cost).
-      "max_instances": 3,
-      // Single-step rollouts: the default staged rollout ([10, 100]) left the
-      // OLD image serving most new instance starts for an indeterminate window
-      // after a successful deploy — observed live: a fixed image deployed green
-      // while fresh boots still ran the broken one. A 3-instance demo app gets
-      // no canary value from staging (Worker + container ship together), and
-      // automated post-deploy testing needs "deploy finished" to mean "new
-      // image serving". 100 = every instance updates in one step.
-      "rollout_step_percentage": 100
-    }
-  ],
+  // ─── CONTAINER DISABLED, 2 AUGUST 2026 ───────────────────────────────────
+  //
+  // The container application `pa-policy-extractor-pacontainer` (id
+  // <container-application-id>, version 15) was DELETED because it
+  // billed wall-clock time in an idle, self-rearming Durable Object alarm loop:
+  // 180,004 ms of wall time against 0 ms of CPU, over and over, while serving
+  // no traffic (exactly one inbound request in the preceding week, a verified
+  // OAI-SearchBot crawl of /robots.txt). It was running 3 instances at
+  // standard-4 — 12 vCPU and 36 GiB standing — for nothing.
+  //
+  // This block stays COMMENTED OUT so a `wrangler deploy` from CI cannot
+  // silently resurrect that fleet. Uncommenting it re-creates the container
+  // application on the next deploy, and re-creates the bill, because the alarm
+  // loop is a property of the deployed code and is NOT fixed yet.
+  //
+  // Note what is deliberately NOT removed: the PaContainer Durable Object
+  // binding, its `v1` migration tag and its class export all remain below, so
+  // the Worker still typechecks and deploys. Every route that would reach the
+  // container short-circuits on CONTAINERS_OFFLINE (src/util.ts) and answers a
+  // 503 with a human sentence.
+  //
+  // ROOT CAUSE, THE EXACT DELETED CONFIG, RESTORE STEPS AND THE
+  // FIX-BEFORE-RESTORING LIST:  docs/CONTAINERS-OFFLINE.md
+  //
+  // "containers": [
+  //   {
+  //     "class_name": "PaContainer",
+  //     "image": "./container/Dockerfile",
+  //     "image_build_context": "./container",
+  //     // standard-4 = 4 vCPU / 12 GiB / 20 GB disk — chosen for CPU OCR
+  //     // headroom, and the largest instance type this account allows.
+  //     "instance_type": "standard-4",
+  //     // Sticky-per-PDF routing fans distinct PDFs out across instances;
+  //     // capped at 3 to bound worst-case concurrent containers (cost).
+  //     // NOTE: 3 is a leftover from batch concurrency and should come back as
+  //     // 1 — see the fix list. Lowering it would NOT have fixed the bill; it
+  //     // would have divided it by three and left the loop running forever.
+  //     "max_instances": 3,
+  //     // Single-step rollouts: the default staged rollout ([10, 100]) left the
+  //     // OLD image serving most new instance starts for an indeterminate
+  //     // window after a successful deploy — observed live: a fixed image
+  //     // deployed green while fresh boots still ran the broken one. A
+  //     // 3-instance demo app gets no canary value from staging (Worker +
+  //     // container ship together), and automated post-deploy testing needs
+  //     // "deploy finished" to mean "new image serving". 100 = every instance
+  //     // updates in one step.
+  //     "rollout_step_percentage": 100
+  //   }
+  // ],
 
   // Durable Object bindings:
   //   PA_CONTAINER    — the Worker's handle to the container class.
@@ -129,6 +157,17 @@
   // DEEPSEEK_API_KEY, CF_AIG_TOKEN and CF_API_TOKEN are SECRETS — set via
   // `wrangler secret put` (or the dashboard), never committed here.
   "vars": {
+    // Container kill switch (2026-08-02) — the runtime half of the commented-out
+    // `containers` block above. While this is anything but an explicit "0", the
+    // Worker refuses every container-backed route (/api/analyze, /api/extract,
+    // /api/health, the /api/jobs staging + creation family, cohort runs, and the
+    // daily cron's cohort re-runs) with a 503 and a human sentence, and never
+    // constructs the PaContainer Durable Object. Absent ALSO means offline —
+    // fail safe. Set to "0" only after the alarm loop in
+    // docs/CONTAINERS-OFFLINE.md is fixed and the container application has been
+    // redeployed.
+    "CONTAINERS_OFFLINE": "1",
+
     // CF_AIG_ACCOUNT_ID: the Cloudflare account id. Used for the AI Gateway, and
     // ALSO required for the W3 multi-model consensus secondary base URL (Workers AI)
     // — not only the AI Gateway. Leave "" to disable both. With BOTH set, the

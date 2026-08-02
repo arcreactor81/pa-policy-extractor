@@ -44,7 +44,11 @@ import { getContainer } from "@cloudflare/containers";
 import type { Env } from "../worker-configuration";
 import type { ExtractResult } from "./types";
 import { persistResults } from "./library";
-import { validateWebhookUrl } from "./util";
+import {
+  CONTAINERS_OFFLINE_MESSAGE,
+  containersOffline,
+  validateWebhookUrl,
+} from "./util";
 
 /** Container instance-name prefix â€” mirrors the Worker's sticky routing so the
  * SAME PDF (by sha256) lands on the SAME warm container instance (OCR-once). */
@@ -748,6 +752,18 @@ export class JobCoordinator extends DurableObject<Env> {
       // consensus-off request stays byte-identical to the original shape.
       if (config.consensus) {
         form.append("consensus", "1");
+      }
+
+      // Container offline (2026-08-02, see ./util). The Worker refuses job
+      // CREATION up front, so a job should never get this far — but a job
+      // already in flight when the container application was deleted, or one
+      // resumed from DO storage after a restart, would otherwise construct the
+      // PaContainer DO and die inside the @cloudflare/containers constructor
+      // with "Containers have not been enabled for this Durable Object class".
+      // Throwing here routes that PDF through the normal per-PDF failure path,
+      // so the job finalizes cleanly with a readable reason instead of hanging.
+      if (containersOffline(this.env)) {
+        throw new Error(CONTAINERS_OFFLINE_MESSAGE);
       }
 
       const container = getContainer(this.env.PA_CONTAINER, route);

@@ -1,5 +1,5 @@
 import { SELF, env } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { BrandsResponse, ErrorResponse, ExtractResult } from "../src/types";
 import { ensureCohortSchema } from "../src/cohorts";
 import { pdfOutcomeAfterDone } from "../src/job-coordinator";
@@ -16,7 +16,10 @@ import {
  * (without waking the container Durable Object): /api/brands, the per-route HTTP
  * method guards, and the unknown-/api/* 404. The container-backed routes
  * (/api/analyze, /api/extract, /api/health) need the PaContainer DO + a built
- * image, so they are validated by reading + the Python CI gate, not here.
+ * image for their SUCCESS paths, so those are validated by reading + the Python
+ * CI gate, not here. Their OFFLINE path — the 503 they answer since the
+ * container application was deleted on 2026-08-02 — is asserted at the bottom of
+ * this file ("container offline switch").
  *
  * We hit the Worker through SELF.fetch so the real routing + bindings apply.
  */
@@ -338,6 +341,17 @@ describe("cohort create source-job owner check (B5)", () => {
  * consensus field sailed through validation.
  */
 describe("POST /api/jobs accepts the consensus form field (B4)", () => {
+  // Form-field validation is independent of whether a container is deployed, so
+  // this block turns the 2026-08-02 offline switch off for its duration (the
+  // deployed default refuses /api/jobs with 503 before parsing the body). The
+  // offline refusal is asserted in its own describe below.
+  beforeAll(() => {
+    (env as unknown as { CONTAINERS_OFFLINE?: string }).CONTAINERS_OFFLINE = "0";
+  });
+  afterAll(() => {
+    (env as unknown as { CONTAINERS_OFFLINE?: string }).CONTAINERS_OFFLINE = "1";
+  });
+
   function jobForm(consensus?: string): FormData {
     const form = new FormData();
     // Deliberately NOT a real PDF — see the describe note above.
@@ -853,5 +867,100 @@ describe("web-check helpers: buildFdaUrl", () => {
     expect(buildFdaUrl("ACITRETIN", "generic_name")).toContain(
       "openfda.generic_name"
     );
+  });
+});
+
+/**
+ * Container offline switch (2026-08-02). The container application
+ * `pa-policy-extractor-pacontainer` was deleted because it billed wall-clock
+ * time in an idle, self-rearming Durable Object alarm loop
+ * (docs/CONTAINERS-OFFLINE.md). The deployed default is CONTAINERS_OFFLINE="1".
+ *
+ * What these assert is the actual deliverable of the shutdown: a request to a
+ * container-backed route gets a CLEAR, HUMAN answer, not an unhandled exception
+ * and not a timeout. Constructing the PaContainer DO with no container
+ * application attached throws "Containers have not been enabled for this
+ * Durable Object class" from inside @cloudflare/containers, which would reach
+ * the browser as an opaque runtime error — so every one of these routes must
+ * return BEFORE getContainer() is called.
+ */
+describe("container offline switch", () => {
+  const OFFLINE_RE = /PDF extraction is offline/i;
+
+  it("/api/analyze answers 503 with a human sentence, not an exception", async () => {
+    const res = await SELF.fetch("https://example.com/api/analyze", {
+      method: "POST",
+      body: new FormData(),
+    });
+    expect(res.status).toBe(503);
+    expect(res.headers.get("x-pa-containers-offline")).toBe("1");
+    expect(res.headers.get("retry-after")).toBe("86400");
+    const body = (await res.json()) as ErrorResponse;
+    expect(body.error).toMatch(OFFLINE_RE);
+    // It must say WHY, and where to read more — not just "unavailable".
+    expect(body.error).toMatch(/shut down/i);
+    expect(body.error).toMatch(/CONTAINERS-OFFLINE\.md/);
+  });
+
+  it("/api/extract answers 503 with the same sentence", async () => {
+    const res = await SELF.fetch("https://example.com/api/extract", {
+      method: "POST",
+      body: new FormData(),
+    });
+    expect(res.status).toBe(503);
+    const body = (await res.json()) as ErrorResponse;
+    expect(body.error).toMatch(OFFLINE_RE);
+  });
+
+  it("/api/health reports the typed down shape instead of waking a container", async () => {
+    const res = await SELF.fetch("https://example.com/api/health");
+    // Health keeps its "never throws" contract: 200 carrying ok:false.
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      ok: boolean;
+      warm: boolean;
+      warm_error: string;
+    };
+    expect(body.ok).toBe(false);
+    expect(body.warm).toBe(false);
+    expect(body.warm_error).toMatch(OFFLINE_RE);
+  });
+
+  it("refuses batch staging at the FIRST call, before any PDF is uploaded", async () => {
+    const res = await SELF.fetch("https://example.com/api/jobs/stage", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        brands: "TREMFYA",
+        files: [{ index: 0, filename: "a.pdf", size: 1024 }],
+      }),
+    });
+    expect(res.status).toBe(503);
+    const body = (await res.json()) as ErrorResponse;
+    expect(body.error).toMatch(OFFLINE_RE);
+  });
+
+  it("refuses legacy /api/jobs before buffering the multipart body", async () => {
+    const res = await SELF.fetch("https://example.com/api/jobs", {
+      method: "POST",
+      body: new FormData(),
+    });
+    expect(res.status).toBe(503);
+    const body = (await res.json()) as ErrorResponse;
+    expect(body.error).toMatch(OFFLINE_RE);
+  });
+
+  it("still answers /api/brands from the Worker (no container needed)", async () => {
+    const res = await SELF.fetch("https://example.com/api/brands");
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as BrandsResponse;
+    expect(body.brands).toHaveLength(15);
+  });
+
+  it("keeps the method guards ahead of the offline refusal", async () => {
+    // A GET on a POST-only route is still 405: the offline switch must not
+    // swallow the pre-existing HTTP contract.
+    const res = await SELF.fetch("https://example.com/api/analyze");
+    expect(res.status).toBe(405);
   });
 });

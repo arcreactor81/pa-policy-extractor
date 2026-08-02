@@ -94,6 +94,18 @@ export interface Env {
   RETENTION_DAYS: string;
 
   /**
+   * Container kill switch (2026-08-02). While this is anything other than an
+   * explicit "0"/"false"/"no"/"off" — INCLUDING ABSENT — every container-backed
+   * route (/api/analyze, /api/extract, /api/health, the /api/jobs staging +
+   * creation family, cohort runs and the daily cron's cohort re-runs) refuses
+   * with a 503 and a human sentence instead of constructing the PaContainer
+   * Durable Object. Defaults to OFFLINE so a missing var can never resurrect
+   * the container fleet. Read via containersOffline() in src/util.ts.
+   * See docs/CONTAINERS-OFFLINE.md.
+   */
+  CONTAINERS_OFFLINE?: string;
+
+  /**
    * #4 (deploy): configurable per-PDF LLM-call budget, forwarded to the container
    * (container/app.py reads MAX_LLM_CALLS) AND used by the Worker's up-front job
    * budget check. Default "200" — sized for the worst legal request: 15 brands

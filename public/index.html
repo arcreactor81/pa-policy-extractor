@@ -61,6 +61,57 @@
 
   <main id="main" class="wrap" tabindex="-1">
 
+    <!-- ─── SERVICE NOTICE: container shut down, 2 August 2026 ───────────────
+         PDF extraction is offline. Deliberately the FIRST thing inside <main>,
+         above the input panel, and deliberately NOT carrying the .reveal /
+         .stagger entrance classes: those start hidden and are only un-hidden by
+         JS, and this notice has to be readable even if no script runs.
+         Styled with the existing amber tokens (see styles.css §"service
+         notice") so it belongs to the same visual language as the rest of the
+         page rather than looking bolted on.
+         TO RESTORE: delete this <section>, drop the /offline.js include at the
+         bottom of this file, and remove the styles.css block. See
+         docs/CONTAINERS-OFFLINE.md. -->
+    <section class="offline-notice" role="status" aria-labelledby="offline-notice-title">
+      <p class="offline-notice__kicker">Service notice &middot; 2 August 2026</p>
+      <h2 class="offline-notice__title" id="offline-notice-title">PDF extraction is offline</h2>
+      <p class="offline-notice__lede">
+        The Cloudflare Container that runs OCR and extraction has been <strong>shut down</strong>, so
+        analyzing a policy PDF does not work right now. This is a deliberate cost decision, not a
+        fault: the container was billing wall-clock time in an idle, self-rearming alarm loop
+        &mdash; <strong>180,004&nbsp;ms of wall time against 0&nbsp;ms of CPU</strong>, over and
+        over, while serving no traffic. It stays off until that is fixed. Nothing was deleted, and
+        the shutdown is reversible.
+      </p>
+      <div class="offline-notice__cols">
+        <div class="offline-notice__col">
+          <p class="offline-notice__coltitle offline-notice__coltitle--ok">Still works</p>
+          <ul class="offline-notice__list">
+            <li><strong>Library</strong> &mdash; browse, search and re-open every saved analysis</li>
+            <li><strong>Ask</strong> &mdash; Q&amp;A across your saved corpus</li>
+            <li><strong>Export</strong> &mdash; JSON, CSV and XLSX of saved results</li>
+            <li><strong>Live Web Check</strong> &mdash; payer page + FDA label</li>
+            <li>Cohort browsing and run-to-run <strong>diffs</strong></li>
+          </ul>
+        </div>
+        <div class="offline-notice__col">
+          <p class="offline-notice__coltitle offline-notice__coltitle--off">Offline</p>
+          <ul class="offline-notice__list">
+            <li><strong>Single</strong> &mdash; uploading a PDF to analyze</li>
+            <li><strong>Batch</strong> &mdash; submitting a new job</li>
+            <li><strong>Run now</strong> on a saved cohort</li>
+          </ul>
+          <p class="offline-notice__note">
+            These controls are disabled rather than left to fail at the network.
+          </p>
+        </div>
+      </div>
+      <p class="offline-notice__foot">
+        Root cause, the exact configuration that was removed, restore steps and the
+        fix-before-restoring list are in <code>docs/CONTAINERS-OFFLINE.md</code>.
+      </p>
+    </section>
+
     <!-- INPUT PANEL -->
     <section class="panel input-panel reveal stagger" aria-labelledby="input-heading">
       <div class="input-headrow">
@@ -981,6 +1032,7 @@
 
   <footer class="app-footer wrap">
     <p class="subtle">Static dashboard served by a Cloudflare Worker &middot; analyses computed by a CPU Docling + DeepSeek v4-pro container that OCRs each PDF once and streams per-brand results. All analytics on this page are derived client-side from the returned policy fields.</p>
+    <p class="subtle">The extraction container is currently <strong>shut down</strong> (2 August 2026) &mdash; see the notice at the top of the page.</p>
   </footer>
 
   <script src="/app.js" defer></script>
@@ -990,5 +1042,10 @@
   <script src="/export.js" defer></script>
   <script src="/cohorts.js" defer></script>
   <script src="/ask.js" defer></script>
+  <!-- Container shut down 2026-08-02: hard-disable the controls whose only
+       destination is the container, with an explanatory tooltip, so they do not
+       fail at the network. Loaded LAST so it wins over the enable/disable logic
+       in app.js / batch.js / cohorts.js. Delete this line to restore. -->
+  <script src="/offline.js" defer></script>
 </body>
 </html>

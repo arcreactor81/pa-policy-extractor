@@ -2,6 +2,54 @@
 
 ![ci](https://github.com/arcreactor81/pa-policy-extractor/actions/workflows/ci.yml/badge.svg)
 
+## Status — PDF extraction is OFFLINE (2 August 2026)
+
+**The container is shut down. Uploading a PDF does not work right now.** The
+Worker, the UI and everything served from D1/R2 are still live; the extraction
+pipeline is not. This is a deliberate cost decision, not an outage.
+
+**What happened.** The Cloudflare Container application backing extraction
+(`pa-policy-extractor-pacontainer`, 3 instances at 4 vCPU / 12 GiB each — 12 vCPU
+and 36 GiB standing) was billing continuously while serving nothing. Over the
+preceding week it received exactly **one** inbound request: a verified
+`OAI-SearchBot` crawl of `/robots.txt`. Every other log entry was the container
+waking *itself* — Durable Object `alarm` events logging **180,004 ms of wall time
+against 0 ms of CPU**, over and over.
+
+**Why.** `PaContainer` sets `sleepAfter = "3m"`, and the `@cloudflare/containers`
+alarm handler parks inside a `setTimeout` for `min(schedules, sleepAfter)` and
+then immediately re-arms with `setAlarm(Date.now())`. Each alarm holds the
+Durable Object open for the full three minutes and chains the next one. Container
+and DO billing is **wall-clock duration, not CPU**, so an idle container bills as
+if it were working. Worth stating plainly: **lowering `max_instances` would not
+have fixed this** — it would have divided the bill by three and left the loop
+running forever.
+
+**Still works** — the analysis **Library** (browse, search, permalink, re-open
+saved results), **Export** (JSON / CSV / XLSX), **Ask** (advisory Q&A over your
+saved corpus), the **Live Web Check** (payer page + FDA label), cohort browsing
+and run-to-run **diffs**, and `GET /api/brands`. None of these touch the
+container.
+
+**Does not work** — uploading a PDF for a **Single** analysis, creating a
+**Batch** job, and **Run now** on a cohort. Those routes answer `503` with a
+plain-English message rather than hanging or throwing; the affected UI controls
+are disabled with a tooltip.
+
+**It is reversible.** Nothing was destroyed: the image is still in the registry
+and the Durable Object namespace, D1 database and R2 buckets are untouched. The
+`containers` block in `wrangler.jsonc` is commented out and the runtime switch
+`CONTAINERS_OFFLINE` defaults to on, so a redeploy from CI cannot silently bring
+the fleet back.
+
+> **Read before restoring:** [docs/CONTAINERS-OFFLINE.md](docs/CONTAINERS-OFFLINE.md)
+> — full root cause, the exact deleted configuration, step-by-step restore
+> instructions, and the ranked **fix-before-restoring** list. The alarm loop is a
+> property of the deployed code and is **not fixed yet**: redeploying as-is
+> re-creates the bill immediately.
+
+---
+
 A Cloudflare-hosted tool that reads a payer **Prior Authorization (PA) policy PDF** for a plaque-psoriasis (PsO) brand, OCRs it, and extracts a structured PA profile plus a 0–100 **Access Score**. A Cloudflare **Worker** serves the dashboard UI and a small JSON API; the heavy lifting (Docling + Surya OCR on CPU, a brand-focused text reducer, and DeepSeek v4-pro reasoning via Cloudflare AI Gateway) runs inside a Cloudflare **Container** that the Worker proxies to. It is a faithful re-host of an existing hackathon pipeline: the original notebooks are reused verbatim so the prompts and validators are byte-identical — the LLM call was swapped from Gemini to DeepSeek v4-pro, plus a small set of documented accuracy overrides (see the [Override layer](#override-layer-deliberate-divergences)).
 
 > Deep dive — original-vs-rehost change log, design decisions, and engineering process: [PROJECT_OVERVIEW.md](PROJECT_OVERVIEW.md).
@@ -49,7 +97,7 @@ Two further Durable Objects support the higher layers: a **`RateLimiter`** (per-
 
 - **Docling + Surya OCR need PyTorch.** They can't run inside a Cloudflare Worker (no native ML runtime), so OCR and document parsing live in a **Container**, which can run a full CPU PyTorch stack. The Worker is the thin, always-on front door.
 - **DeepSeek v4-pro is text-only.** The reasoning model can't see the PDF's images or scanned pages, so **OCR must run first** to turn the PDF into text. Docling produces markdown + a structured document; the reducer narrows it to the brand- and PsO-relevant passages before the model reads it.
-- **Worker ⇄ Container split** keeps the latency-sensitive UI/API on the edge while the slow, memory-heavy ML work is isolated in a container that sleeps when idle (`sleepAfter: "3m"`).
+- **Worker ⇄ Container split** keeps the latency-sensitive UI/API on the edge while the slow, memory-heavy ML work is isolated in a container that is *supposed* to sleep when idle (`sleepAfter: "3m"`). **It did not.** `sleepAfter` interacts badly with the `@cloudflare/containers` alarm re-arm and the container never actually went idle — see [Status](#status--pdf-extraction-is-offline-2-august-2026) and [docs/CONTAINERS-OFFLINE.md](docs/CONTAINERS-OFFLINE.md). This is the single most expensive assumption in the design, and it was wrong.
 
 ## What it extracts
 
@@ -105,18 +153,26 @@ The score is always one of `{0, 25, 50, 75, 100}`, accompanied by a one-sentence
 
 ## API endpoints
 
-All under `/api/`, served by the Worker (rate-limited where it matters, behind the security headers):
+All under `/api/`, served by the Worker (rate-limited where it matters, behind the security headers).
+
+> **⛔ = offline right now.** While `CONTAINERS_OFFLINE` is set (see
+> [Status](#status--pdf-extraction-is-offline-2-august-2026)) these routes return
+> `503` with `x-pa-containers-offline: 1` and a plain-English `error`, *before*
+> the PaContainer Durable Object is constructed. `GET /api/health` is the one
+> exception: it keeps its "never throws" contract and returns `200` carrying
+> `{ok: false, warm: false, warm_error: "PDF extraction is offline …"}`.
+> Everything unmarked works normally.
 
 | Method & path | Purpose |
 |---|---|
 | `GET /api/brands` | the 15 in-scope brands |
-| `GET /api/health` | container liveness + resolved (non-secret) LLM config |
-| `POST /api/analyze?route=<sha256>` | single PDF, **streaming NDJSON** (multipart `file` + `brands` csv + optional `runs`/`explain`); `route` is the client-computed PDF hash for sticky OCR-cache routing |
-| `POST /api/extract` | single PDF + single `brand`, non-streaming JSON |
-| `POST /api/jobs/stage` | validate the full batch config + manifest before upload; returns an upload session and deterministic per-index PUT URLs |
-| `PUT /api/jobs/stage/:uploadId/files/:index` | stream one raw PDF into its deterministic R2 key; requires the declared `Content-Length` and `%PDF-` magic bytes |
-| `POST /api/jobs/stage/:uploadId/start` | verify every manifest index, commit the staged session, and start the idempotent job → `202 {jobId}` |
-| `POST /api/jobs` | legacy multipart batch submission (1..N PDFs + `brands` + `runs`/`explain`/`consensus`), with a 100 MiB actual-streamed-body cap → `202 {jobId}` |
+| `GET /api/health` | container liveness + resolved (non-secret) LLM config — **⛔ reports `ok:false` while offline** |
+| ⛔ `POST /api/analyze?route=<sha256>` | single PDF, **streaming NDJSON** (multipart `file` + `brands` csv + optional `runs`/`explain`); `route` is the client-computed PDF hash for sticky OCR-cache routing |
+| ⛔ `POST /api/extract` | single PDF + single `brand`, non-streaming JSON |
+| ⛔ `POST /api/jobs/stage` | validate the full batch config + manifest before upload; returns an upload session and deterministic per-index PUT URLs |
+| ⛔ `PUT /api/jobs/stage/:uploadId/files/:index` | stream one raw PDF into its deterministic R2 key; requires the declared `Content-Length` and `%PDF-` magic bytes |
+| ⛔ `POST /api/jobs/stage/:uploadId/start` | verify every manifest index, commit the staged session, and start the idempotent job → `202 {jobId}` |
+| ⛔ `POST /api/jobs` | legacy multipart batch submission (1..N PDFs + `brands` + `runs`/`explain`/`consensus`), with a 100 MiB actual-streamed-body cap → `202 {jobId}` |
 | `GET /api/jobs/:id` | poll job state |
 | `GET /api/jobs/:id/stream?lastSeq=N` | **WebSocket**: live events + replay from `lastSeq` |
 | `GET /api/results?jobId=...` | the batch aggregate in R2; it may exist while hard-gated finalization is still running, so confirm `GET /api/jobs/:id` reports `status: "complete"` before treating it as terminal |
@@ -126,7 +182,7 @@ All under `/api/`, served by the Worker (rate-limited where it matters, behind t
 | `GET /api/library/lookup?sha=&brand=&runs=&explain=` | **response cache**: most-recent matching analysis → full JSON (skip a re-run) |
 | `GET /api/cohorts` / `POST /api/cohorts` | list / create a **saved cohort** (a named PDF set built from a finished batch job) |
 | `PATCH /api/cohorts/:id` / `DELETE /api/cohorts/:id` | update (name, brands, runs, explain, webhook, schedule) / delete |
-| `POST /api/cohorts/:id/run` | re-run the cohort as a **new versioned batch job** → `202` |
+| ⛔ `POST /api/cohorts/:id/run` | re-run the cohort as a **new versioned batch job** → `202` |
 | `GET /api/cohorts/:id/runs` | list the cohort's runs (versions), newest first |
 | `GET /api/cohorts/:id/compare?a=&b=` | **field-level version diff** between two runs |
 | `POST /api/webcheck` | start an **advisory live web check** (one brand's extracted params vs the payer's live policy page + FDA label, via a Cloudflare **Workflow**) → `202 {id}` |
@@ -156,6 +212,14 @@ Normal cohort completion uses `Idempotency-Key: pa-policy-extractor/cohort-run/<
 > You don't build anything locally — `git push` triggers the image build + deploy in CI.
 
 ## Setup & deploy
+
+> **These steps deploy the Worker only.** The `containers` block in
+> `wrangler.jsonc` is commented out and `CONTAINERS_OFFLINE` is `"1"`, so a
+> deploy from CI brings up the UI and API with extraction switched off — by
+> design. Do **not** simply uncomment the block to get extraction back: the
+> alarm loop that caused the shutdown is still in the deployed code and the bill
+> returns immediately. Follow
+> [docs/CONTAINERS-OFFLINE.md](docs/CONTAINERS-OFFLINE.md) instead.
 
 1. **(Optional) Create a Cloudflare AI Gateway.** In the Cloudflare dashboard → **AI** → **AI Gateway**, create a gateway and note its **account ID** and **gateway ID**. The container builds this endpoint:
 
@@ -197,7 +261,9 @@ Normal cohort completion uses `Idempotency-Key: pa-policy-extractor/cohort-run/<
    }
    ```
 
-   `wrangler.jsonc` also sets the container `instance_type` (`standard-4`), `max_instances` (`3`), and `Container.sleepAfter` (`3m`) — the main cost levers. Lower `max_instances` / `sleepAfter` to spend less; raise them for more throughput.
+   `wrangler.jsonc` also carries `CONTAINERS_OFFLINE` (`"1"` — the kill switch; absent also means offline) and, in the commented-out `containers` block, the container `instance_type` (`standard-4`), `max_instances` (`3`) and `Container.sleepAfter` (`3m`).
+
+   These were described as "the main cost levers", with the advice to lower `max_instances` / `sleepAfter` to spend less. **That advice was insufficient and is the reason this project is now offline.** `sleepAfter` does not reliably put the container to sleep — the alarm handler re-arms around it — and `max_instances` scales an idle bill rather than ending it. Read [docs/CONTAINERS-OFFLINE.md](docs/CONTAINERS-OFFLINE.md) before touching either.
 
 3. **Add the GitHub Actions deploy secrets** (repo → **Settings → Secrets and variables → Actions**):
 
@@ -323,7 +389,7 @@ The notebook files themselves are never edited — every accuracy fix is applied
 ## Limitations
 
 - **CPU OCR is slow.** Surya OCR + Docling run on CPU (Cloudflare Containers have no GPU), so a multi-page policy can take from tens of seconds to a few minutes.
-- **Cold starts reload models.** After the container sleeps (`sleepAfter: "3m"`), the next request pays a warm-up cost while the OCR/layout models load back into memory. (A build-time warmup bakes the models into the image so cold starts don't re-download them.)
+- **Cold starts reload models.** After the container sleeps (`sleepAfter: "3m"`), the next request pays a warm-up cost while the OCR/layout models load back into memory. (A build-time warmup bakes the models into the image so cold starts don't re-download them.) **In practice the container did not sleep at all** — the alarm loop kept it awake indefinitely, which is why it is now shut down; see [docs/CONTAINERS-OFFLINE.md](docs/CONTAINERS-OFFLINE.md).
 - **Large/long PDFs may approach request limits.** Very large or very long documents take longer to OCR and can push against request-duration limits. Each PDF is capped at 20 MiB; the staged path supports at most 25 PDFs and 500 MiB declared total, while the legacy multipart route is capped at 100 MiB of actual streamed request bytes.
 - **LLM nondeterminism.** Even at temperature 0.1, DeepSeek output can vary slightly between runs.
 - **This is a re-host, not the original GPU pipeline.** It reproduces the original logic on CPU at demo scale; it is not tuned for high-throughput or GPU-accelerated batch processing.
@@ -332,9 +398,31 @@ The notebook files themselves are never edited — every accuracy fix is applied
 
 ## Cost & subscription budget
 
-The system is **bounded to the Workers Paid included allotments** for realistic, low-concurrency (Access-gated) use — typically the **$5/mo base with no overage**:
+> **This section was wrong, and it is the reason the container is now off.**
+>
+> It claimed the system stays inside the Workers Paid **$5/mo base allotment with
+> no overage**. That claim did not survive contact with reality. The reasoning
+> below is sound for *per-request* cost — the LLM, D1, R2 and Durable Object
+> numbers all held — but every line of it was budgeting the cost of **doing
+> work**, and the bill came from **not doing work**: an idle container held open
+> by a self-rearming Durable Object alarm, billed on wall-clock duration rather
+> than CPU. 180,004 ms of wall time at 0 ms of CPU, continuously, for a service
+> that received one crawler request in a week.
+>
+> The specific bad assumption is the first bullet: *"the container sleeps after
+> `sleepAfter: "3m"` idle … bounding idle billing."* It did not sleep. Nothing
+> else in this section defends against that, because everything else caps
+> **per-request** spend, and there were no requests.
+>
+> Two lessons worth keeping: **a per-request budget is not a bill**, and
+> **budget-by-design is not a spend cap**. The one control here that would
+> actually have bounded the damage is the hard cap below — which was documented
+> as optional and never set. Treat the rest of this section as the per-request
+> cost model it is, valid only while the container is fixed and running.
 
-- **Container compute** (the main lever): the container sleeps after **`sleepAfter: "3m"`** idle and `max_instances` is capped at **3**, bounding idle billing and worst-case concurrency. **Multi-brand parallelism adds no container cost** — there's one container per PDF; brands run as threads inside it (OCR'd once).
+The per-request cost model, for reference:
+
+- **Container compute** (the main lever): the container was *intended* to sleep after **`sleepAfter: "3m"`** idle, with `max_instances` capped at **3** to bound worst-case concurrency. **The sleep did not happen** (see [Status](#status--pdf-extraction-is-offline-2-august-2026)); `max_instances: 3` only ever bounded concurrency, never idle time, and is itself a leftover from batch tuning — one instance is enough for interactive single-document use. **Multi-brand parallelism adds no container cost** — there's one container per PDF; brands run as threads inside it (OCR'd once).
 - **DeepSeek tokens** (the real variable cost): capped per request by **`MAX_LLM_CALLS`** (default 200 — sized so the worst *legal* request fits: all 15 brands with the Deep-Confidence toggle (runs=3), spans, and both validators on is 15 × (2×3 + 1 + 2×3) = **195 calls**; a default interactive upload is far smaller since `CONFIDENCE_RUNS` is `"1"`), and observable/limitable in your **AI Gateway** (rate + spend controls, with `cf-aig-metadata` tagging per brand + feature).
 - **Workers AI validators** (the 3-way Cross-check — **ON by default in the UI**): billed in **Neurons**, working out to roughly **a cent per validator call** at the median policy size (`gpt-oss-20b` $0.20/$0.30 per M input/output tokens; `mistral-small-3.1-24b` $0.35/$0.56 per M). A default upload (runs=1, spans on, Cross-check on) spends brands × (2 + 1 + 2) calls, of which the 2 per brand are validators; the **10,000 free Neurons/day** cover light demo use. Validator calls now route **through the AI Gateway**, so the spend cap below applies to them too. Untick Cross-check (or unset `CF_API_TOKEN`) for zero validator cost.
 - **Durable Objects + R2** (batch): **WebSocket hibernation** means a connected-but-idle job bills ~zero duration; R2 holds PDFs + results only for `RETENTION_DAYS` (7) before auto-delete — well inside the R2 free tier. Uncommitted staged sessions expire after 48 hours and the daily sweep removes their deterministic PDF objects and markers.
@@ -343,6 +431,14 @@ The system is **bounded to the Workers Paid included allotments** for realistic,
 - **Tunable knobs** (`wrangler.jsonc`): `sleepAfter`, `max_instances`, `MAX_LLM_CALLS`, `CONFIDENCE_RUNS`, `MAX_PDFS_PER_JOB`, `MAX_CONCURRENT_PDFS`, `RETENTION_DAYS`, `LIBRARY_RETENTION_DAYS`.
 
 ### Hard spend cap (~$5/mo)
+
+**Set this. It was documented as optional and left unset, and that is why an
+idle container could bill without anything stopping it.** A spend cap is the one
+backstop that survives every other mistake, including the ones you have not
+thought of yet. Note the scope, though: the AI Gateway cap below governs **LLM**
+spend only — it would not have capped container wall-clock billing. For that,
+watch container spend directly and keep `max_instances` at what interactive use
+actually needs.
 
 If you want a true ceiling rather than budget-by-design: Cloudflare dashboard → **AI** → **AI Gateway** → *your gateway* → **Settings** → set a **budget / spend limit** (~$5/month works for demo use) and, optionally, a **rate limit**. Because **both** the DeepSeek primary **and** the Workers AI validators now route through the gateway, this single limit caps **all** LLM spend for the app. Two complementary backstops: DeepSeek is **prepaid**, so its account balance is its own natural ceiling, and the Cloudflare dashboard offers **Workers AI usage alerts/notifications** if you want an early warning before the cap bites.
 
