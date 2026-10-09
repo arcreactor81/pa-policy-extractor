@@ -5,9 +5,10 @@
   "compatibility_date": "2026-06-01",
 
   // Keep the Worker OFF its public *.workers.dev hostname. Access is enforced at
-  // the edge on the custom domain (<custom-domain>); an
-  // Access application is bound to a HOSTNAME, so a live workers.dev hostname is
-  // a second front door that the policy does not cover.
+  // the edge on the operator's custom domain (attached in the Cloudflare
+  // dashboard, not in this file); an Access application is bound to a HOSTNAME,
+  // so a live workers.dev hostname is a second front door that the policy does
+  // not cover.
   //
   // This is declared here rather than toggled in the dashboard because a toggle
   // does not survive: the subdomain was disabled on 2026-08-02, and the very
@@ -18,13 +19,13 @@
 
   // ─── CONTAINER DISABLED, 2 AUGUST 2026 ───────────────────────────────────
   //
-  // The container application `pa-policy-extractor-pacontainer` (id
-  // <container-application-id>, version 15) was DELETED because it
-  // billed wall-clock time in an idle, self-rearming Durable Object alarm loop:
-  // 180,004 ms of wall time against 0 ms of CPU, over and over, while serving
-  // no traffic (exactly one inbound request in the preceding week, a verified
-  // OAI-SearchBot crawl of /robots.txt). It was running 3 instances at
-  // standard-4 — 12 vCPU and 36 GiB standing — for nothing.
+  // The container application `pa-policy-extractor-pacontainer` (version 15)
+  // was DELETED because it billed wall-clock time in an idle, self-rearming
+  // Durable Object alarm loop: 180,004 ms of wall time against 0 ms of CPU,
+  // over and over, while serving no traffic (exactly one inbound request in
+  // the preceding week, a verified OAI-SearchBot crawl of /robots.txt). It was
+  // running 3 instances at standard-4 — 12 vCPU and 36 GiB standing — for
+  // nothing.
   //
   // This block stays COMMENTED OUT so a `wrangler deploy` from CI cannot
   // silently resurrect that fleet. Uncommenting it re-creates the container
@@ -93,7 +94,8 @@
   // ALSO holds the persistent-library full result JSON (results/lib/<id>.json),
   // whose lean index lives in the LIBRARY D1 database below.
   //
-  // KNOWLEDGE_BUCKET ("pa-knowledge", already provisioned) backs the ADVISORY
+  // KNOWLEDGE_BUCKET ("pa-knowledge"; create it before the first deploy, see
+  // OPERATOR SETUP below) backs the ADVISORY
   // "Ask" feature: every saved analysis and every web-check verdict ALSO writes
   // a markdown digest to knowledge/<owner>/<sha>-<brand>[-webcheck].md (the
   // owner path segment is the tenancy boundary AI Search folder filters scope
@@ -122,12 +124,21 @@
   // EXISTS (see src/library.ts → ensureLibrarySchema), so there is NO local
   // `wrangler d1 migrations` step.
   //
-  // OPERATOR SETUP: the "pa-library" D1 database and "pa-job-results" R2 bucket
-  // are already provisioned in this account (created 2026-06-10). FORKS deploying
-  // to a different account must create both (dashboard or `wrangler d1 create
-  // pa-library` / `wrangler r2 bucket create pa-job-results`) and replace the
-  // `database_id` below. Both D1 and R2 are on the Workers Paid included tiers,
-  // so this stays subscription-bounded.
+  // OPERATOR SETUP, before the first deploy: create the "pa-library" D1 database
+  // and the "pa-job-results" and "pa-knowledge" R2 buckets in YOUR Cloudflare
+  // account (dashboard, or `wrangler d1 create pa-library` and
+  // `wrangler r2 bucket create <name>`). The deploy fails if any is missing.
+  //
+  // `database_id` below is a PLACEHOLDER (all zeros). Supply the real id in one
+  // of two ways:
+  //   * CI deploys (.github/workflows/deploy.yml): leave the zeros and store the
+  //     id as the GitHub Actions secret PA_LIBRARY_DATABASE_ID. The deploy job
+  //     writes it in just before `wrangler deploy` and stops with an error if
+  //     the secret is missing or malformed.
+  //   * Deploying by hand: replace the zeros with your database's id (and keep
+  //     that edit out of any public repository).
+  // Both D1 and R2 are on the Workers Paid included tiers, so this stays
+  // subscription-bounded.
   "d1_databases": [
     {
       "binding": "LIBRARY",
@@ -180,12 +191,18 @@
     // redeployed.
     "CONTAINERS_OFFLINE": "1",
 
-    // CF_AIG_ACCOUNT_ID: the Cloudflare account id. Used for the AI Gateway, and
+    // CF_AIG_ACCOUNT_ID: your Cloudflare account id. Used for the AI Gateway, and
     // ALSO required for the W3 multi-model consensus secondary base URL (Workers AI)
     // — not only the AI Gateway. Leave "" to disable both. With BOTH set, the
     // DeepSeek primary AND the Workers AI validators route through the gateway
-    // "firstgateway", so its budget/spend cap governs all LLM traffic.
-    "CF_AIG_ACCOUNT_ID": "<account-id>",
+    // named in CF_AIG_GATEWAY_ID (change it to your own gateway's id), so its
+    // budget/spend cap governs all LLM traffic.
+    //
+    // The value committed here is a PLACEHOLDER. CI deploys replace it with the
+    // CLOUDFLARE_ACCOUNT_ID GitHub Actions secret (the account the Worker is
+    // deployed into) just before `wrangler deploy`. Deploying by hand: put your
+    // account id here, or "" to disable the gateway and the validators.
+    "CF_AIG_ACCOUNT_ID": "<your-cloudflare-account-id>",
     "CF_AIG_GATEWAY_ID": "firstgateway",
     "DEEPSEEK_MODEL": "deepseek-v4-pro",
     "DEEPSEEK_THINKING": "on",

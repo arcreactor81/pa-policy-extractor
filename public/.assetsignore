@@ -1,0 +1,8 @@
+# Files in public/ that must NOT be uploaded as public static assets.
+# Wrangler reads this list (same syntax as .gitignore) on deploy and in
+# local dev; the .assetsignore file itself is never uploaded.
+#
+# batch-state.d.ts is the TypeScript declaration for batch-state.js. It has to
+# sit next to the .js file so the test typecheck (npm run typecheck:test) can
+# type the import in test/batch-replay.test.ts, but no page requests it.
+*.d.ts

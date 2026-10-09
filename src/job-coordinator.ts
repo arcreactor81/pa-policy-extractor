@@ -1,5 +1,5 @@
 /**
- * job-coordinator.ts â€” Layer 3: async / batch / persistent jobs.
+ * job-coordinator.ts - Layer 3: async / batch / persistent jobs.
  *
  * The JobCoordinator is a SQLite-backed Durable Object that owns the lifecycle
  * of a multi-PDF extraction job:
@@ -9,7 +9,7 @@
  *   2. The DO processes the PDFs with a small concurrency SEMAPHORE
  *      (MAX_CONCURRENT_PDFS, default 2, always <= container max_instances). For
  *      each PDF it reads the bytes back from R2, builds a multipart body
- *      (file + brands + runs + explain [+ consensus] â€” exactly the fields
+ *      (file + brands + runs + explain [+ consensus] - exactly the fields
  *      container/app.py's POST /analyze expects) and streams the NDJSON response.
  *   3. Every container event is given a monotonic `seq_num`, wrapped with
  *      {pdf_index, filename, seq_num}, appended to the `job_events` SQLite log
@@ -30,13 +30,13 @@
  *
  * VERIFIED-DOC GOTCHAS honoured here:
  *   - storage.sql.exec() cursors are consumed SYNCHRONOUSLY (spread into an
- *     array / .toArray() / .one()) BEFORE any `await` â€” a cursor left open
+ *     array / .toArray() / .one()) BEFORE any `await` - a cursor left open
  *     across an await is invalid.
- *   - serializeAttachment is capped (~16KB) â€” we only ever attach the tiny
+ *   - serializeAttachment is capped (~16KB) - we only ever attach the tiny
  *     {jobId,lastSeq} bookkeeping object.
  *   - WebSockets drop on deploy; replay-on-reconnect is the recovery path.
  *   - A DO may make subrequests to the container and read long response streams
- *     (this is I/O, not CPU â€” no CPU-wall limit).
+ *     (this is I/O, not CPU - no CPU-wall limit).
  */
 
 import { DurableObject } from "cloudflare:workers";
@@ -50,7 +50,7 @@ import {
   validateWebhookUrl,
 } from "./util";
 
-/** Container instance-name prefix â€” mirrors the Worker's sticky routing so the
+/** Container instance-name prefix - mirrors the Worker's sticky routing so the
  * SAME PDF (by sha256) lands on the SAME warm container instance (OCR-once). */
 const ROUTE_PREFIX = "pa-";
 
@@ -72,12 +72,12 @@ export type FinalizationState =
 export interface JobConfig {
   /** CSV of brands forwarded to the container's `brands` field. */
   brands: string;
-  /** Repeated extraction+scoring runs (1..5) â€” container `runs` field. */
+  /** Repeated extraction+scoring runs (1..5) - container `runs` field. */
   runs: number;
-  /** Source-span explainability pass â€” container `explain` field. */
+  /** Source-span explainability pass - container `explain` field. */
   explain: boolean;
   /**
-   * W3-ext multi-model consensus â€” container `consensus` field. Optional for
+   * W3-ext multi-model consensus - container `consensus` field. Optional for
    * back-compat with older start payloads (absent = off); only forwarded to the
    * container when true, so consensus-off requests stay byte-identical.
    */
@@ -92,7 +92,7 @@ export interface JobConfig {
    */
   owner?: string;
 
-  // â”€â”€ W5 (cohort runs) â€” all optional; absent for a normal /api/jobs batch â”€â”€â”€â”€â”€
+  // -- W5 (cohort runs) - all optional; absent for a normal /api/jobs batch -----
 
   /**
    * Validated https webhook URL to notify on finalize (a cohort run). The DO
@@ -249,7 +249,7 @@ function toHex(buf: ArrayBuffer): string {
   return out;
 }
 
-/** sha256-hex of the PDF bytes â€” the sticky container instance key. */
+/** sha256-hex of the PDF bytes - the sticky container instance key. */
 async function sha256hex(bytes: ArrayBuffer): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", bytes);
   return toHex(digest);
@@ -298,7 +298,7 @@ function isProcessingAbandoned(value: string | null): boolean {
  * Decide a PDF's terminal status once its stream cleanly reached `done`:
  * per-brand errors are non-fatal in-stream, so a PDF whose brands ALL errored
  * still reaches `done` having produced ZERO `result` events. Treating that as
- * "complete" would silently drop the PDF from the results â€” fail it instead
+ * "complete" would silently drop the PDF from the results - fail it instead
  * (fail-soft: the job keeps going, the failure is recorded). `resultCount` is
  * the number of `result` events tracked for the PDF (job_pdfs.results).
  * Exported as a pure helper so the decision is unit-testable without a DO.
@@ -316,7 +316,7 @@ export function pdfOutcomeAfterDone(resultCount: number): {
 /**
  * Watchdog cadence while a job is non-terminal. Processing rides a single
  * ctx.waitUntil promise, which a DO restart (deploy, eviction, crash) silently
- * orphans â€” observed live: a job sat status="running" / PDF "pending" for hours
+ * orphans - observed live: a job sat status="running" / PDF "pending" for hours
  * because the only alarm was retention, days away. While non-terminal, the
  * alarm slot is a short-cadence watchdog that resumes orphaned processing;
  * only a TERMINAL job schedules the retention alarm.
@@ -326,7 +326,7 @@ const WATCHDOG_MS = 3 * 60 * 1000;
 /**
  * Idle guard on the container NDJSON stream. The container heartbeats every
  * few seconds even mid-OCR, so a read that delivers nothing for this long is a
- * dead instance (e.g. restarted mid-stream) â€” fail the PDF instead of awaiting
+ * dead instance (e.g. restarted mid-stream) - fail the PDF instead of awaiting
  * a body that will never end.
  */
 const STREAM_IDLE_MS = 180 * 1000;
@@ -456,7 +456,7 @@ export class JobCoordinator extends DurableObject<Env> {
     // on every hot-path event append.
   }
 
-  // â”€â”€ seq_num allocation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // -- seq_num allocation ------------------------------------------------------
 
   /**
    * Return the next monotonic seq_num. We read MAX(seq_num) from SQLite ONCE
@@ -477,13 +477,13 @@ export class JobCoordinator extends DurableObject<Env> {
     return this.seqCursor;
   }
 
-  // â”€â”€ Worker â†’ DO control plane â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // -- Worker -> DO control plane -----------------------------------------------
 
   /**
    * HTTP surface the Worker uses to drive the DO:
-   *   POST /start            â†’ begin processing (body: StartJobBody)
-   *   GET  /state            â†’ JobStateResponse JSON
-   *   GET  /stream?lastSeq=N â†’ WebSocket upgrade (replay + live)
+   *   POST /start            -> begin processing (body: StartJobBody)
+   *   GET  /state            -> JobStateResponse JSON
+   *   GET  /stream?lastSeq=N -> WebSocket upgrade (replay + live)
    * The Worker addresses the DO via idFromName(jobId), so every request here
    * already belongs to one job.
    */
@@ -584,7 +584,7 @@ export class JobCoordinator extends DurableObject<Env> {
     });
   }
 
-  // â”€â”€ Job processing (semaphore + container fan-out) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // -- Job processing (semaphore + container fan-out) --------------------------
 
   /**
    * processJob wrapper owning the `processing` flag and the alarm handoff:
@@ -787,7 +787,7 @@ export class JobCoordinator extends DurableObject<Env> {
       );
 
       // The container streamed a PDF-LEVEL fatal (an {"event":"error"} with no
-      // "brand" key â€” e.g. "OCR failed" / last-resort "extraction failed") and/or
+      // "brand" key - e.g. "OCR failed" / last-resort "extraction failed") and/or
       // never emitted the trailing {"event":"done"}. The HTTP transport was fine
       // (res.ok), so only the in-band stream tells us the extraction crashed.
       // Record the PDF as FAILED (a per-brand error still leaves it complete).
@@ -856,7 +856,7 @@ export class JobCoordinator extends DurableObject<Env> {
    * fatal (OCR failed / last-resort "extraction failed") with an {"event":"error"}
    * carrying NO "brand" key and WITHOUT the trailing {"event":"done"} (core.py:796,
    * app.py:230); a clean run always ends with {"event":"done"} (core.py:874), and a
-   * per-brand error ({"event":"error","brand":...}) is non-fatal â€” the run still
+   * per-brand error ({"event":"error","brand":...}) is non-fatal - the run still
    * reaches `done`. So the PDF succeeded iff we saw `done` and no PDF-level error.
    */
   private async consumeNdjson(
@@ -892,7 +892,7 @@ export class JobCoordinator extends DurableObject<Env> {
       // Idle guard: the container heartbeats every few seconds, so a read that
       // stays pending past STREAM_IDLE_MS means the instance died mid-stream
       // (observed live during a restart). Fail the PDF instead of awaiting a
-      // body that never ends â€” the watchdog/caller error path takes over.
+      // body that never ends - the watchdog/caller error path takes over.
       let idleTimer: ReturnType<typeof setTimeout> | undefined;
       const idle = new Promise<never>((_, reject) => {
         idleTimer = setTimeout(
@@ -948,7 +948,7 @@ export class JobCoordinator extends DurableObject<Env> {
     try {
       parsed = JSON.parse(line) as Record<string, unknown>;
     } catch {
-      // Non-JSON noise from the stream â€” wrap it so nothing is silently lost.
+      // Non-JSON noise from the stream - wrap it so nothing is silently lost.
       parsed = { event: "error", error: "malformed event from container" };
     }
     this.emit(jobId, pdfIndex, filename, parsed, attempt);
@@ -1086,7 +1086,7 @@ export class JobCoordinator extends DurableObject<Env> {
     });
   }
 
-  // â”€â”€ Durable finalization â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // -- Durable finalization ---------------------------------------------------
 
   /**
    * Freeze terminal inputs before the first external side effect. Job status
@@ -1959,7 +1959,7 @@ export class JobCoordinator extends DurableObject<Env> {
     );
   }
 
-  // â”€â”€ GET /state (poll) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // -- GET /state (poll) -------------------------------------------------------
 
   private async handleState(): Promise<Response> {
     const sql = this.ctx.storage.sql;
@@ -2054,7 +2054,7 @@ export class JobCoordinator extends DurableObject<Env> {
     });
   }
 
-  // â”€â”€ GET /stream (WebSocket: replay + live, hibernatable) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // -- GET /stream (WebSocket: replay + live, hibernatable) ---------------------
 
   /**
    * Accept a WebSocket via the HIBERNATION API, tag it with the job tag (so
@@ -2106,10 +2106,10 @@ export class JobCoordinator extends DurableObject<Env> {
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  // â”€â”€ Hibernation handlers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // -- Hibernation handlers ---------------------------------------------------
 
   /**
-   * Inbound client messages. The stream is serverâ†’client only; we accept a
+   * Inbound client messages. The stream is server->client only; we accept a
    * "ping"/"resume" control frame so a reconnecting client can request a replay
    * from a given seq without reopening the socket.
    */
@@ -2145,7 +2145,7 @@ export class JobCoordinator extends DurableObject<Env> {
     }
   }
 
-  /** A socket closed â€” nothing to clean up (hibernation drops it for us). */
+  /** A socket closed - nothing to clean up (hibernation drops it for us). */
   override async webSocketClose(
     ws: WebSocket,
     code: number,
@@ -2166,7 +2166,7 @@ export class JobCoordinator extends DurableObject<Env> {
     // Errored sockets are dropped by the runtime; nothing to do.
   }
 
-  // â”€â”€ Alarm dispatcher: watchdog (non-terminal) / retention (terminal) â”€â”€â”€â”€â”€â”€â”€â”€
+  // -- Alarm dispatcher: watchdog (non-terminal) / retention (terminal) --------
 
   /**
    * One alarm slot, two duties.
@@ -2192,7 +2192,7 @@ export class JobCoordinator extends DurableObject<Env> {
         .toArray();
 
       if (jobRows.length === 0) {
-        // Already cleaned up â€” nothing to do.
+        // Already cleaned up - nothing to do.
         return;
       }
 

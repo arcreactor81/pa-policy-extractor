@@ -1,5 +1,23 @@
 # PA Policy Extractor — Full Project Overview & Change Log
 
+> **Historical document.** This briefing describes the project as it was built,
+> before the PDF-extraction container was shut down on **2 August 2026**. For the
+> current state, the [README](README.md) (its "Status" section) and
+> [docs/CONTAINERS-OFFLINE.md](docs/CONTAINERS-OFFLINE.md) are authoritative. In
+> particular:
+>
+> - **PDF extraction is offline.** The container application was deleted to stop
+>   an idle, self-rearming alarm loop billing wall-clock time; the Worker, library,
+>   export, Ask and web-check features still run.
+> - **The cost model in §10 is retracted.** The "stays inside the ~$5/mo Workers
+>   Paid allotment" claim did not hold; see the README's "Cost & subscription
+>   budget".
+> - **The feature list and repository map predate** the Ask (corpus Q&A) and Live
+>   Web Check features and the offline switch.
+>
+> A few small facts (the file count, the upload caps and the setup steps in §12)
+> were corrected in place on 9 October 2026; everything else is left as written.
+
 > **Purpose of this document.** This is a complete, self-contained briefing you can hand to an LLM (or a person)
 > so they understand: (1) the **original hackathon project**, (2) the **goal** of this work, (3) the **hard
 > constraints** that forced a re-architecture, (4) **what was built** on Cloudflare, (5) **exactly what changed vs.
@@ -24,11 +42,11 @@ AI Gateway.
 - Built and validated almost entirely by **multi-agent workflows with adversarial review** (the human directed; agents
   implemented + cross-checked), and graded by an independent **Opus codebase evaluation**.
 
-Repo: `pa-policy-extractor/` (~65 files). Deploy: push to GitHub → GitHub Actions builds the container + `wrangler deploy`.
+Repo: `pa-policy-extractor/` (~85 files). Deploy: push to GitHub → GitHub Actions builds the container + `wrangler deploy`.
 
 ---
 
-## 1. The Original Project (`CANDIDATE_ID`)
+## 1. The Original Project (the hackathon submission)
 
 A hackathon submission: **extract structured Prior-Authorization parameters for the Plaque Psoriasis (PsO) indication**
 from pharmaceutical PA policy PDFs, for a given drug brand. (The author's own hackathon submission — this repo is a
@@ -85,7 +103,7 @@ It ran **locally** (GPU optional, CPU fallback), needed a **Gemini API key**, an
 
 ## 2. The Goal
 
-> "Deploy the pipeline present in `CANDIDATE_ID` to Cloudflare Workers as a project I can host on my GitHub."
+> "Deploy the pipeline present in `<submission folder>` to Cloudflare Workers as a project I can host on my GitHub."
 
 Refined through conversation into concrete decisions (see §4).
 
@@ -206,8 +224,9 @@ RateLimiter, JobCoordinator), **R2** (object storage), **D1** (SQLite — the li
   (field-level diff), **webhook on completion** (SSRF-guarded), and an **off-by-default** scheduled cron.
 
 ### Security / ops
-- Per-IP **rate-limit** Durable Object, per-request **LLM-call budget** (`MAX_LLM_CALLS`), 20 MB per-PDF body cap
-  + 100 MB total batch-upload cap (defeats chunked-bypass), **prompt-injection delimiting** of untrusted policy text, strict **CSP + security headers**, **error
+- Per-IP **rate-limit** Durable Object, per-request **LLM-call budget** (`MAX_LLM_CALLS`), 20 MiB per-PDF cap,
+  staged batch jobs bounded to 25 PDFs / 500 MiB declared total, a 100 MiB actual-streamed-body cap on the legacy
+  multipart batch route (defeats chunked-bypass), **prompt-injection delimiting** of untrusted policy text, strict **CSP + security headers**, **error
   sanitization** (no internal/gateway detail leaked), optional **Access-JWT verification** for verified tenant
   isolation, **library retention** prune, and **AI Gateway cost monitoring** (`cf-aig-metadata` tags per brand+feature).
 
@@ -297,6 +316,9 @@ retention** prune added, `MAX_LLM_CALLS` made a real forwarded var, README API/c
 
 ## 10. Cost / Subscription Model
 
+> **Retracted (August 2026).** This model budgeted the cost of doing work; the bill came from an idle container
+> that never went to sleep. See the README's "Cost & subscription budget" for the correction.
+
 Designed to live inside the **Workers Paid (~$5/mo)** included allotments for low-concurrency, Access-gated use:
 - **Container compute** (the main lever): `sleepAfter = 3m`, `max_instances = 3`. Multi-brand parallelism adds **no**
   container cost (one container per PDF; brands are threads inside it).
@@ -366,11 +388,13 @@ pa-policy-extractor/
 ## 12. How to Deploy (no local builds)
 
 1. Push the repo to GitHub `main`.
-2. GitHub → Settings → Secrets and variables → **Actions**: add `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`.
-3. R2 + D1: **already provisioned for this account** — the `pa-job-results` bucket exists and the `pa-library`
-   Database ID is wired into `wrangler.jsonc` (`d1_databases[0].database_id`). Forks deploying elsewhere create their
-   own (**R2 → create bucket `pa-job-results`**; **D1 → create database `pa-library`**) and swap in their `database_id`.
-4. Set `CF_AIG_ACCOUNT_ID` / `CF_AIG_GATEWAY_ID` (your AI Gateway) in `wrangler.jsonc` vars.
+2. GitHub → Settings → Secrets and variables → **Actions**: add `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID` and
+   `PA_LIBRARY_DATABASE_ID`.
+3. R2 + D1: create them first, in your own account (**R2 → create buckets `pa-job-results` and `pa-knowledge`**;
+   **D1 → create database `pa-library`**) and store the database's id as the `PA_LIBRARY_DATABASE_ID` secret.
+   `wrangler.jsonc` ships with placeholder ids; the deploy workflow fills them in on the runner.
+4. Set `CF_AIG_GATEWAY_ID` (your AI Gateway) in `wrangler.jsonc` vars; `CF_AIG_ACCOUNT_ID` is filled from
+   `CLOUDFLARE_ACCOUNT_ID` at deploy time.
 5. Push → the `ci` workflow runs first; once it succeeds on `main`, the deploy workflow fires: GitHub Actions builds
    `container/Dockerfile` on the runner and `wrangler deploy`s the Worker + 3 DOs + R2 + D1 + cron. (Manual dispatch
    of the deploy workflow bypasses the CI gate.)
@@ -392,8 +416,8 @@ pa-policy-extractor/
   one single PDF, a 2-PDF batch with a mid-job reload (reconnect), a cohort run, and the consensus toggle.
 - **LLM nondeterminism**: outputs vary slightly run-to-run (as the original documented). DeepSeek v4-pro ≠ Gemini, so
   exact values can differ from the original locked run.
-- **CPU OCR is slow** with cold starts (no GPU); large/long PDFs can approach request limits (20 MB per-PDF cap,
-  100 MB total per batch upload; very long docs are brand-aware window packed for the LLM past the input guards — see
+- **CPU OCR is slow** with cold starts (no GPU); large/long PDFs can approach request limits (20 MiB per-PDF cap;
+  staged batches up to 25 PDFs / 500 MiB declared, the legacy multipart route 100 MiB streamed; very long docs are brand-aware window packed for the LLM past the input guards — see
   `PRIMARY_MAX_CHARS` / `SCORING_MAX_CHARS`).
 - This is a **re-host, not the original GPU pipeline** — same logic, CPU-bound, demo-scale.
 
@@ -403,7 +427,7 @@ pa-policy-extractor/
 - **GPU OCR via RunPod** (the explicitly-excluded item) — 20–40× OCR speedup for volume; would offload OCR to a GPU box
   the Worker calls.
 - Deeper RAG-grounded fact-checking; richer enterprise exports; multi-region/tenant scaling.
-- A parity harness that re-runs the bundled corpus and diffs against the original `CANDIDATE_ID_results.xlsx`.
+- A parity harness that re-runs the bundled corpus and diffs against the original submission's results workbook.
 
 ---
 

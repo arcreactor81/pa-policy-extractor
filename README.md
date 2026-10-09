@@ -221,6 +221,26 @@ Normal cohort completion uses `Idempotency-Key: pa-policy-extractor/cohort-run/<
 > returns immediately. Follow
 > [docs/CONTAINERS-OFFLINE.md](docs/CONTAINERS-OFFLINE.md) instead.
 
+> **Forking this repository? Change these first.** The committed
+> `wrangler.jsonc` carries placeholders, not working values, for the
+> account-specific ids:
+>
+> 1. **Create the storage** in your own Cloudflare account: the `pa-library` D1
+>    database and the `pa-job-results` and `pa-knowledge` R2 buckets (step 4).
+>    The deploy fails if any of them is missing.
+> 2. **Add three GitHub Actions secrets:** `CLOUDFLARE_API_TOKEN`,
+>    `CLOUDFLARE_ACCOUNT_ID` and `PA_LIBRARY_DATABASE_ID` (step 3). The deploy
+>    workflow writes the account id and the database id into `wrangler.jsonc`
+>    on the runner just before deploying; the repository keeps the placeholders.
+> 3. **Point `CF_AIG_GATEWAY_ID`** in `wrangler.jsonc` at your own AI Gateway,
+>    or set it to `""` to call DeepSeek directly (steps 1–2).
+> 4. **Add the Worker secrets** after the first deploy: `DEEPSEEK_API_KEY`, and
+>    `CF_API_TOKEN` for the cross-check and the live web check (step 6).
+> 5. **Put the Worker behind Cloudflare Access** on your own domain (see
+>    [Access control](#access-control-tenant-isolation--abuse-protection)).
+>    Leave `"workers_dev": false` in `wrangler.jsonc` so the public
+>    `workers.dev` hostname stays off.
+
 1. **(Optional) Create a Cloudflare AI Gateway.** In the Cloudflare dashboard → **AI** → **AI Gateway**, create a gateway and note its **account ID** and **gateway ID**. The container builds this endpoint:
 
    ```
@@ -229,7 +249,7 @@ Normal cohort completion uses `Idempotency-Key: pa-policy-extractor/cohort-run/<
 
    If you skip this, the container falls back to `https://api.deepseek.com`.
 
-2. **Set the plain (non-secret) gateway vars** in `wrangler.jsonc` so they are forwarded into the container:
+2. **Set the plain (non-secret) gateway vars** in `wrangler.jsonc` so they are forwarded into the container. `CF_AIG_ACCOUNT_ID` is committed as the placeholder `<your-cloudflare-account-id>`: CI deploys fill it from the `CLOUDFLARE_ACCOUNT_ID` secret, so you only need to edit it when deploying by hand. Set `CF_AIG_GATEWAY_ID` to your own gateway's id.
 
    ```jsonc
    "vars": {
@@ -268,15 +288,14 @@ Normal cohort completion uses `Idempotency-Key: pa-policy-extractor/cohort-run/<
 3. **Add the GitHub Actions deploy secrets** (repo → **Settings → Secrets and variables → Actions**):
 
    - `CLOUDFLARE_API_TOKEN` — a token with Workers + Containers deploy permissions.
-   - `CLOUDFLARE_ACCOUNT_ID` — your Cloudflare account ID.
+   - `CLOUDFLARE_ACCOUNT_ID` — your Cloudflare account ID. The deploy workflow also writes it into `wrangler.jsonc` as `CF_AIG_ACCOUNT_ID`.
+   - `PA_LIBRARY_DATABASE_ID` — the Database ID of your `pa-library` D1 database (step 4). The deploy workflow writes it into `wrangler.jsonc` → `d1_databases[0].database_id`, which is committed as all zeros. If the secret is missing while the placeholder is still there, the deploy stops with an error rather than deploying a broken binding.
 
-4. **R2 bucket + D1 database — already provisioned for this account.** The **`pa-job-results`** R2 bucket and the **`pa-library`** D1 database already exist in the operator's Cloudflare account, and the D1 **Database ID is already wired into `wrangler.jsonc`** (`d1_databases[0].database_id`) — nothing to do here before the first deploy.
-
-   **Forks deploying to a different account** must create their own (one-time — **both must exist before the first deploy**; the deploy fails otherwise) and swap in their own Database ID:
+4. **Create the R2 buckets and the D1 database — before the first deploy.** They are not created for you, and the deploy fails if any is missing (one-time setup):
 
    - **R2 bucket:** Cloudflare dashboard → **R2 → Create bucket** → name it exactly **`pa-job-results`**. Batch jobs store PDFs + results here, and it also holds the persistent-library full-result JSON (`results/lib/<id>.json`). *(The `JobCoordinator` auto-deletes each job's objects after `RETENTION_DAYS`; an optional R2 Object-Lifecycle rule on the `pdfs/` + `results/` prefixes is extra insurance.)*
-   - **Knowledge R2 bucket:** likewise create a second bucket named exactly **`pa-knowledge`** (already provisioned in the operator's account). It holds the markdown **knowledge digests** behind the advisory [Ask](#ask-your-corpus-advisory-qa--ai-search-dashboard-setup) feature; like `pa-job-results`, it must exist before the first deploy (the R2 binding is declared in `wrangler.jsonc`).
-   - **D1 database:** Cloudflare dashboard → **Workers & Pages → D1 → Create database** → name it exactly **`pa-library`**. Then copy its **Database ID** and paste it into `wrangler.jsonc` → `d1_databases[0].database_id`, replacing this account's id. This database backs the persistent analysis library, the response cache, and saved cohorts (the `analyses` + `cohorts` tables; schema is created lazily at runtime, so there is no `wrangler d1 migrations` step).
+   - **Knowledge R2 bucket:** likewise create a second bucket named exactly **`pa-knowledge`**. It holds the markdown **knowledge digests** behind the advisory [Ask](#ask-your-corpus-advisory-qa--ai-search-dashboard-setup) feature; like `pa-job-results`, it must exist before the first deploy (the R2 binding is declared in `wrangler.jsonc`).
+   - **D1 database:** Cloudflare dashboard → **Workers & Pages → D1 → Create database** → name it exactly **`pa-library`**. Then copy its **Database ID** and store it as the `PA_LIBRARY_DATABASE_ID` GitHub Actions secret (step 3). If you deploy by hand instead of through CI, paste it into `wrangler.jsonc` → `d1_databases[0].database_id` in place of the zeros, and keep that edit out of any public repository. This database backs the persistent analysis library, the response cache, and saved cohorts (the `analyses` + `cohorts` tables; schema is created lazily at runtime, so there is no `wrangler d1 migrations` step).
 
    Both R2 and D1 are on the Workers Paid included tiers, so this stays subscription-bounded.
 
@@ -442,6 +461,22 @@ actually needs.
 
 If you want a true ceiling rather than budget-by-design: Cloudflare dashboard → **AI** → **AI Gateway** → *your gateway* → **Settings** → set a **budget / spend limit** (~$5/month works for demo use) and, optionally, a **rate limit**. Because **both** the DeepSeek primary **and** the Workers AI validators now route through the gateway, this single limit caps **all** LLM spend for the app. Two complementary backstops: DeepSeek is **prepaid**, so its account balance is its own natural ceiling, and the Cloudflare dashboard offers **Workers AI usage alerts/notifications** if you want an early warning before the cap bites.
 
+## Disclaimer
+
+The output of this tool is an automated, model-generated reading of a payer's policy document. It can be incomplete, wrong or out of date, and it is **not coverage advice, legal advice or medical advice**: it does not tell anyone whether a drug will be covered for a particular patient. Always check the payer's current policy, and ask a qualified professional before acting on it. This project is **not affiliated with, endorsed by or sponsored by any payer, pharmacy benefit manager, drug manufacturer or drug brand it names**; those names are trademarks of their owners and appear only to identify the documents and products being analysed.
+
 ## License
 
-MIT — see [LICENSE](LICENSE).
+The code in this repository is released under the MIT License — see [LICENSE](LICENSE).
+
+Dependencies keep their own licences, and so do the bundled fonts: DM Sans, Instrument Serif and JetBrains Mono (in `public/fonts/`) are licensed under the SIL Open Font License 1.1 — see [public/fonts/OFL.txt](public/fonts/OFL.txt).
+
+### Third-party licences
+
+The MIT licence covers this repository's own code only. The container's OCR stack includes copyleft code and model weights with commercial restrictions, which matters to anyone deploying this commercially:
+
+- **`surya-ocr`** — the release pinned in `container/constraints.txt` (0.17.1), which the container image installs, is licensed **GPL-3.0-or-later**. (Newer upstream releases may be licensed differently; check the version you actually install.)
+- **`docling-surya`** — the pinned release (0.1.0) is licensed **GPL-3.0**.
+- **Surya's model weights**, which the image build downloads and bakes in, are under a **modified OpenRAIL-M licence** that restricts commercial use beyond the exceptions the vendor lists (such as research, personal use and small startups). Read [Surya's current terms](https://github.com/datalab-to/surya#commercial-usage) before any commercial deployment.
+
+The licences above were checked on 9 October 2026 against each package's published licence metadata and, for the model weights, Surya's own README. This summary is not legal advice.

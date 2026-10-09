@@ -16,13 +16,12 @@
 
 // ── container offline switch (2026-08-02) ─────────────────────────────────────
 //
-// The `pa-policy-extractor-pacontainer` container application (id
-// <container-application-id>, version 15) was DELETED on 2 August 2026
-// because it billed wall-clock time in an idle, self-rearming Durable Object
-// alarm loop — 180,004 ms of wall time against 0 ms of CPU, repeatedly, while
-// serving no traffic. Full root cause, the exact deleted configuration, the
-// restore steps and the fix-before-restore list live in
-// docs/CONTAINERS-OFFLINE.md.
+// The `pa-policy-extractor-pacontainer` container application (version 15)
+// was DELETED on 2 August 2026 because it billed wall-clock time in an idle,
+// self-rearming Durable Object alarm loop — 180,004 ms of wall time against
+// 0 ms of CPU, repeatedly, while serving no traffic. Full root cause, the
+// exact deleted configuration, the restore steps and the fix-before-restore
+// list live in docs/CONTAINERS-OFFLINE.md.
 //
 // The `containers` block in wrangler.jsonc is commented out to match, but the
 // PaContainer Durable Object CLASS is still bound (the binding, the migration

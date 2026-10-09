@@ -1,5 +1,5 @@
 /**
- * pa-policy-extractor â€” Cloudflare Worker
+ * pa-policy-extractor - Cloudflare Worker
  *
  * This Worker is a thin, robust front for a Cloudflare Container that runs the
  * Python extraction pipeline (Docling/Surya OCR -> brand reducer -> DeepSeek v4-pro
@@ -108,7 +108,7 @@ const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
 const MAX_JOB_UPLOAD_BYTES = 100 * 1024 * 1024;
 
 /**
- * Layer 3 LLM-call budget per PDF â€” the Worker's up-front mirror of the
+ * Layer 3 LLM-call budget per PDF - the Worker's up-front mirror of the
  * container's configurable MAX_LLM_CALLS (#4: default "200"). A job submission is
  * rejected up front if any PDF would exceed it, so we never stage work the
  * container will refuse: brands * (2*runs + (explain ? 1 : 0) + validators*runs),
@@ -119,14 +119,14 @@ const MAX_JOB_UPLOAD_BYTES = 100 * 1024 * 1024;
  */
 const DEFAULT_MAX_LLM_CALLS = 200;
 
-/** Resolve the configurable per-PDF LLM-call budget from env (default 200 â€” sized for the worst legal request: 15 brands * (2*3 deep runs + 1 spans + 2 validators * 3 runs) = 195). */
+/** Resolve the configurable per-PDF LLM-call budget from env (default 200 - sized for the worst legal request: 15 brands * (2*3 deep runs + 1 spans + 2 validators * 3 runs) = 195). */
 function maxLlmCalls(env: Env): number {
   const n = Number(env.MAX_LLM_CALLS ?? "");
   return Number.isFinite(n) && n > 0 ? Math.trunc(n) : DEFAULT_MAX_LLM_CALLS;
 }
 
 /**
- * Default Workers AI validator list â€” mirrors PaContainer.envVars below.
+ * Default Workers AI validator list - mirrors PaContainer.envVars below.
  * Both models have 128k context on Workers AI (policy docs reach ~75k tokens;
  * Workers AI hard-errors on oversized input) and top-tier JSON reliability.
  */
@@ -137,7 +137,7 @@ const DEFAULT_VALIDATOR_MODELS =
  * Mirror the container's llm.secondary_enabled() gate for the batch budget: the
  * W3-ext validators only run when CF_API_TOKEN (the Workers AI token) AND
  * CF_AIG_ACCOUNT_ID (which builds the secondary base URL) are configured AND the
- * VALIDATOR_MODELS list is non-empty. Returns the active validator count â€” 0
+ * VALIDATOR_MODELS list is non-empty. Returns the active validator count - 0
  * whenever consensus would silently no-op in the container, so the Worker's
  * budget check never rejects a job the container would have accepted.
  */
@@ -185,7 +185,7 @@ function instanceNameFor(url: URL): string {
 }
 
 /**
- * PaContainer â€” the Container Durable Object. Listens on 8080 and forwards the
+ * PaContainer - the Container Durable Object. Listens on 8080 and forwards the
  * DeepSeek / AI Gateway environment into the container process so llm.py can
  * build the gateway endpoint (and fall back to api.deepseek.com if absent).
  */
@@ -218,19 +218,19 @@ export class PaContainer extends Container<Env> {
     VALIDATOR_MODELS: this.env.VALIDATOR_MODELS ?? DEFAULT_VALIDATOR_MODELS,
     // #4 (deploy): the documented, configurable per-PDF LLM-call budget the
     // container enforces (container/app.py reads MAX_LLM_CALLS from env). Default
-    // "200" (worst legal request: 15 brands * (2*3 + 1 + 2*3) = 195) â€” mirrored
+    // "200" (worst legal request: 15 brands * (2*3 + 1 + 2*3) = 195) - mirrored
     // by the Worker's up-front job budget check (maxLlmCalls).
     MAX_LLM_CALLS: this.env.MAX_LLM_CALLS ?? "200",
     // Accuracy-pipeline tunables (container/pipeline reads these; defaults match
     // the in-code constants so omitting them changes nothing). CONFIDENCE_RUNS
-    // is the omitted-`runs` default â€” "1" keeps interactive uploads fast (the UI
+    // is the omitted-`runs` default - "1" keeps interactive uploads fast (the UI
     // Deep-Confidence toggle / batch path send runs explicitly); the other two
     // are the override layer's reducer-passthrough and scoring-truncation
     // thresholds.
     CONFIDENCE_RUNS: this.env.CONFIDENCE_RUNS ?? "1",
     REDUCER_PASSTHROUGH_CHARS: this.env.REDUCER_PASSTHROUGH_CHARS ?? "100000",
     SCORING_MAX_CHARS: this.env.SCORING_MAX_CHARS ?? "300000",
-    // Primary input guard â€” above the scoring cap so small/medium documents
+    // Primary input guard - above the scoring cap so small/medium documents
     // reach the model whole; huge documents get brand-aware window packing.
     // Kept well under DeepSeek's 1M-token window: maximal-context prefill
     // measured at 10+ min/call, untenable for interactive use.
@@ -262,7 +262,7 @@ function applySecurityHeaders(headers: Headers): void {
 
 /**
  * Wrap a Response so the security headers are present without copying/buffering
- * the body (the body stream is reused as-is â€” safe for the NDJSON passthrough).
+ * the body (the body stream is reused as-is - safe for the NDJSON passthrough).
  */
 function withSecurityHeaders(res: Response): Response {
   const headers = new Headers(res.headers);
@@ -314,7 +314,7 @@ function containersOfflineResponse(): Response {
 /**
  * Proxy a request to the container at `path`. The original request is streamed
  * through unchanged (method + headers + body) by re-pointing its URL at the
- * container path â€” we never re-parse the multipart body. `instanceName`
+ * container path - we never re-parse the multipart body. `instanceName`
  * implements sticky routing (see instanceNameFor): the same PDF reuses one warm
  * instance; distinct PDFs fan out across instances.
  */
@@ -382,9 +382,9 @@ async function enforceRateLimit(
   return res;
 }
 
-// â”€â”€â”€ Layer 3: async/batch jobs (/api/jobs, /api/results) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// --- Layer 3: async/batch jobs (/api/jobs, /api/results) ----------------------
 //
-// These routes are ADDITIVE â€” the live single-PDF flow above is untouched. The
+// These routes are ADDITIVE - the live single-PDF flow above is untouched. The
 // Worker stages uploads in R2 and delegates job lifecycle to the JobCoordinator
 // DO (addressed by idFromName(jobId)); long work + streaming happen in the DO.
 
@@ -1442,7 +1442,7 @@ async function handleStageRoute(
 }
 
 /**
- * POST /api/jobs â€” accept a multipart batch (1..MAX_PDFS_PER_JOB files +
+ * POST /api/jobs - accept a multipart batch (1..MAX_PDFS_PER_JOB files +
  * brands + runs + explain + consensus), stage each PDF in R2
  * (pdfs/<jobId>/<i>.pdf), tell the JobCoordinator DO to start, and return 202
  * {jobId}. Caps enforced: per-file size, file count, total body size, and the
@@ -1534,7 +1534,7 @@ async function handleCreateJob(
   const pdfs: { index: number; filename: string }[] = [];
   // Sequential, not Promise.all: each iteration's `bytes` is loop-scoped and
   // eligible for GC before the next file is read, so only one ~20MB buffer is
-  // live at a time â€” keeping us clear of the 128MB isolate limit on big batches.
+  // live at a time - keeping us clear of the 128MB isolate limit on big batches.
   for (let i = 0; i < files.length; i++) {
     const file = files[i];
     const bytes = await file.arrayBuffer();
@@ -1585,7 +1585,7 @@ async function handleCreateJob(
   return json({ jobId }, 202);
 }
 
-/** GET /api/jobs/:id â€” forward to the DO's /state (poll). */
+/** GET /api/jobs/:id - forward to the DO's /state (poll). */
 async function handleGetJob(env: Env, jobId: string): Promise<Response> {
   const id = env.JOB_COORDINATOR.idFromName(jobId);
   const stub = env.JOB_COORDINATOR.get(id);
@@ -1596,7 +1596,7 @@ async function handleGetJob(env: Env, jobId: string): Promise<Response> {
 }
 
 /**
- * GET /api/jobs/:id/stream?lastSeq=N â€” forward the WebSocket upgrade to the DO.
+ * GET /api/jobs/:id/stream?lastSeq=N - forward the WebSocket upgrade to the DO.
  * The DO accepts via the hibernation API, replays events with seq_num > N, then
  * streams live. We hand the upgrade through unchanged so the 101 + webSocket
  * propagate back to the client.
@@ -1614,7 +1614,7 @@ async function handleJobStream(
   const id = env.JOB_COORDINATOR.idFromName(jobId);
   const stub = env.JOB_COORDINATOR.get(id);
   // Re-point the original request (preserving the Upgrade: websocket header) at
-  // the DO's /stream path â€” same technique as proxyToContainer. The 101
+  // the DO's /stream path - same technique as proxyToContainer. The 101
   // Switching Protocols + webSocket pass straight back to the client.
   const doUrl = `https://jc/stream?lastSeq=${encodeURIComponent(lastSeq)}`;
   const proxied = new Request(doUrl, request);
@@ -1622,7 +1622,7 @@ async function handleJobStream(
 }
 
 /**
- * GET /api/results?jobId=.. â€” stream the finished results JSON from R2
+ * GET /api/results?jobId=.. - stream the finished results JSON from R2
  * (results/<jobId>.json); 404 if the job has not finished (or was reaped).
  */
 async function handleGetResults(env: Env, url: URL): Promise<Response> {
@@ -1639,9 +1639,9 @@ async function handleGetResults(env: Env, url: URL): Promise<Response> {
   return new Response(obj.body, { status: 200, headers });
 }
 
-// â”€â”€â”€ W5: saved cohorts (/api/cohorts[...]) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// --- W5: saved cohorts (/api/cohorts[...]) -----------------------------------
 //
-// All routes are OWNER-scoped (the cf-access identity) and ADDITIVE â€” they reuse
+// All routes are OWNER-scoped (the cf-access identity) and ADDITIVE - they reuse
 // the SAME LIBRARY D1 + RESULT_BUCKET R2 (more tables, persistent cohort PDFs).
 // Cohort PDFs live under R2 cohorts/<id>/*; running a cohort stages those PDFs
 // into a NEW batch job via the existing JobCoordinator path. POSTs are rate-
@@ -1705,7 +1705,7 @@ async function handleCohortRoutes(
         405
       );
     }
-    // A run stages PDFs into a new job (container work) â€” rate-limit it.
+    // A run stages PDFs into a new job (container work) - rate-limit it.
     // Container offline (2026-08-02): a cohort run IS a batch job, so it can do
     // nothing while the container is gone. Browsing cohorts, their past runs and
     // the run-to-run diff (/runs, /compare) still works — that data is already
@@ -1823,7 +1823,7 @@ export default {
         applySecurityHeaders(headers);
         return new Response(res.body, { status: res.status, headers });
       } catch (err) {
-        // Health must never throw â€” report the container as down.
+        // Health must never throw - report the container as down.
         const down: HealthDownResponse = {
           ok: false,
           warm: false,
@@ -2074,10 +2074,10 @@ export default {
     }
 
     // --- Persistent library: /api/library[...] -----------------------------
-    // POST /api/library            â€” save per-brand results (R2 full json + D1 index).
-    // GET  /api/library            â€” owner-scoped browse/search (facets + paging).
-    // GET  /api/library/lookup     â€” response cache: most-recent match -> full json.
-    // GET  /api/library/:id        â€” owner-checked; stream the full json from R2.
+    // POST /api/library            - save per-brand results (R2 full json + D1 index).
+    // GET  /api/library            - owner-scoped browse/search (facets + paging).
+    // GET  /api/library/lookup     - response cache: most-recent match -> full json.
+    // GET  /api/library/:id        - owner-checked; stream the full json from R2.
     // All are tenant-scoped to the cf-access-authenticated-user-email identity.
     if (pathname === "/api/library") {
       if (request.method === "POST") {
@@ -2178,12 +2178,12 @@ export default {
     }
 
     // --- P0: live web check /api/webcheck[...] ------------------------------
-    // POST /api/webcheck          â€” start an ADVISORY web-check Workflow (one
+    // POST /api/webcheck          - start an ADVISORY web-check Workflow (one
     //                               brand's extracted params vs live sources).
-    // GET  /api/webcheck/status   â€” poll the Workflow instance status by id.
-    // GET  /api/webcheck          â€” the persisted verdict JSON from R2 (404
+    // GET  /api/webcheck/status   - poll the Workflow instance status by id.
+    // GET  /api/webcheck          - the persisted verdict JSON from R2 (404
     //                               until the workflow's persist step ran).
-    // Advisory only â€” nothing here ever touches analysis results. The status
+    // Advisory only - nothing here ever touches analysis results. The status
     // poll is keyed by the unguessable instance id (same posture as the jobId
     // poll); the verdict GET is owner-checked against the stored doc.
     if (pathname === "/api/webcheck/status") {
@@ -2209,7 +2209,7 @@ export default {
 
     if (pathname === "/api/webcheck") {
       if (request.method === "POST") {
-        // Rate limit (per client IP) BEFORE creating a Workflow instance â€” a
+        // Rate limit (per client IP) BEFORE creating a Workflow instance - a
         // check spends Browser Rendering fetches plus a DeepSeek call.
         const limited = await enforceRateLimit(env, request);
         if (limited) return limited;
@@ -2275,16 +2275,16 @@ export default {
     }
 
     // --- Ask: advisory Q&A over the caller's knowledge corpus ---------------
-    // POST /api/ask                 â€” question -> AI Search (retrieval +
+    // POST /api/ask                 - question -> AI Search (retrieval +
     //                                 generation + citations), scoped to the
     //                                 caller's own knowledge/<owner>/ digests.
-    // POST /api/knowledge/backfill  â€” (re)write digests for the caller's
+    // POST /api/knowledge/backfill  - (re)write digests for the caller's
     //                                 existing library rows (idempotent).
     // Both are ADVISORY only and rate-limited + owner-resolved HERE (the
-    // handlers in src/knowledge.ts receive the resolved owner â€” same split as
+    // handlers in src/knowledge.ts receive the resolved owner - same split as
     // the webcheck routes). When the dashboard-created AI Search instance is
     // absent/misnamed, /api/ask degrades to a clean 503 and NOTHING else is
-    // affected â€” digest writes and Ask errors never touch analysis flows.
+    // affected - digest writes and Ask errors never touch analysis flows.
     if (pathname === "/api/ask") {
       if (request.method !== "POST") {
         return json(
@@ -2365,11 +2365,11 @@ export default {
   },
 
   /**
-   * scheduled() â€” W5 budget-safe daily cron (triggers.crons in wrangler.jsonc,
+   * scheduled() - W5 budget-safe daily cron (triggers.crons in wrangler.jsonc,
    * default "0 6 * * *"). Re-runs ONLY cohorts that opted in (schedule_enabled=1),
    * across ALL owners. With nothing opted in this is an INERT, near-zero-cost
    * daily D1 check: one indexed SELECT over `cohorts` returns no rows and we
-   * return immediately â€” NO container is woken and NO job is created.
+   * return immediately - NO container is woken and NO job is created.
    *
    * COST NOTE: every scheduled cohort that DOES run stages its PDFs into a new
    * batch job, so it spends container vCPU-minutes (the same cost as a manual
@@ -2427,7 +2427,7 @@ async function runScheduledCohorts(env: Env): Promise<void> {
   ).all<{ id: string; owner: string }>();
   const cohorts = res.results ?? [];
   if (cohorts.length === 0) {
-    // Inert: nothing opted in â€” return without waking a container or staging work.
+    // Inert: nothing opted in - return without waking a container or staging work.
     return;
   }
 
@@ -2603,7 +2603,7 @@ const MAX_LIBRARY_PRUNE_PER_RUN = 500;
  * days. Owner-AGNOSTIC (a maintenance sweep, not a tenant operation). Safe +
  * idempotent: R2 delete on a missing key is a no-op, and we delete the R2 objects
  * BEFORE the D1 rows so a crash mid-prune never orphans a row that still has its
- * object â€” at worst an object is re-deleted next run.
+ * object - at worst an object is re-deleted next run.
  */
 async function pruneLibrary(env: Env): Promise<void> {
   try {
@@ -2624,7 +2624,7 @@ async function pruneLibrary(env: Env): Promise<void> {
       .bind(cutoff, MAX_LIBRARY_PRUNE_PER_RUN)
       .all<{ id: string; result_key: string }>();
     const rows = res.results ?? [];
-    if (rows.length === 0) return; // nothing expired â€” inert.
+    if (rows.length === 0) return; // nothing expired - inert.
 
     // Delete the R2 objects first (idempotent), then the D1 index rows.
     const keys = rows.map((r) => r.result_key).filter((k): k is string => !!k);

@@ -132,7 +132,7 @@ reversible:
 |---|---|
 | Container image (still in the registry) | `registry.cloudflare.com/<account-id>/pa-policy-extractor-pacontainer:20577153` |
 | Durable Object namespace | `<durable-object-namespace-id>` |
-| D1 database | `pa-library` — `00000000-0000-0000-0000-000000000000` |
+| D1 database | `pa-library` — `<database-id>` |
 | R2 buckets | `pa-job-results`, `pa-knowledge` |
 | Worker + all other bindings | deployed and serving |
 
@@ -198,7 +198,7 @@ browsing and diffs, `GET /api/brands`, and reading any existing job or result.
 
 | # | Item | Status | Effort | Blocker? |
 |---|---|---|---|---|
-| 1 | AI Gateway hard spend cap | VERIFIED | minutes | **Blocker** |
+| 1 | AI Gateway hard spend cap | Recommended | minutes | **Blocker** |
 | 2 | `max_instances: 3` → `1` | VERIFIED | one line | **Blocker** |
 | 3 | The alarm loop | VERIFIED — *the cause* | real work | **Blocker** |
 | 4 | `enforceRateLimit` fails open | VERIFIED | ~10 lines | **Blocker** (spending routes) |
@@ -207,29 +207,15 @@ browsing and diffs, `GET /api/brands`, and reading any existing job or result.
 
 ### 1. Set a hard spend cap on the AI Gateway — **blocker**
 
-**VERIFIED** against the live gateway config on 2026-08-02:
+The project routes its LLM calls through a Cloudflare AI Gateway (the one named
+by `CF_AIG_GATEWAY_ID` in `wrangler.jsonc`). Both the DeepSeek primary and the
+Workers AI validators go through it, so one gateway budget can govern all LLM
+spend. Before restoring, make sure that gateway has a hard spend limit and a rate
+limit.
 
-```json
-{ "id": "firstgateway", "authentication": false,
-  "rate_limiting_limit": 0, "rate_limiting_interval": 0,
-  "workers_ai_billing_mode": "postpaid" }
-```
-
-No authentication, no rate limiting, and no spend cap. Both the DeepSeek primary
-and the Workers AI validators route through this gateway, so one budget governs
-all LLM spend.
-
-**Mitigating fact, for accuracy:** unauthenticated probes of the gateway returned
-**401 at $0 cost**, because the provider keys live in the Workers, not in the
-gateway. A stranger can *relay* through it but cannot *spend* through it. The
-gateway being open is therefore not an active leak — but it is also not a
-control, and it is the cheapest one available.
-
-Do it: dashboard → **AI** → **AI Gateway** → `firstgateway` → **Settings** →
+Do it: dashboard → **AI** → **AI Gateway** → *your gateway* → **Settings** →
 budget/spend limit, plus a rate limit. This is the backstop that survives every
-other mistake in this list, including the ones nobody has found yet. It was
-already documented in the README as optional, and left unset — which is precisely
-how a project ends up paying for an idle container.
+other mistake in this list, including the ones nobody has found yet.
 
 Note the scope honestly: **this caps LLM spend, not container wall-clock spend.**
 Nothing in the AI Gateway would have stopped the alarm loop. Container cost needs
@@ -330,8 +316,8 @@ Also **VERIFIED**:
   the custom domain around **1–2 August** — *after* the 28 July crawl. (The exact
   cutover time was not independently confirmed here; the reachability evidence is
   from the Worker's own logs.)
-- Edge enforcement **is** live on the custom domain
-  `<custom-domain>` via the Access application.
+- Edge enforcement **is** live on the custom domain (`<custom-domain>`) via the
+  Access application.
 
 What remains **UNVERIFIED**, and should be read as an open question rather than a
 finding:
@@ -388,7 +374,7 @@ gone**, and nothing will tell you.
   the most have no identity handling whatsoever.
 
 **The important nuance, so this is not overstated:** edge enforcement via the
-Access application **is** configured on `<custom-domain>`.
+Access application **is** configured on the custom domain (`<custom-domain>`).
 Requests through the custom domain *are* authenticated at the edge, and the
 identity header they carry is set by Cloudflare. The in-Worker JWT verification
 is **defence-in-depth for any path that bypasses the edge** — a `workers.dev`

@@ -15,7 +15,13 @@
 #
 # Secrets required (Repository → Settings → Secrets and variables → Actions):
 #   CLOUDFLARE_API_TOKEN   — token with Workers + Containers deploy permissions.
-#   CLOUDFLARE_ACCOUNT_ID  — the Cloudflare account to deploy into.
+#   CLOUDFLARE_ACCOUNT_ID  — the Cloudflare account to deploy into. Also written
+#                            into wrangler.jsonc as the CF_AIG_ACCOUNT_ID var.
+#   PA_LIBRARY_DATABASE_ID — the id of the "pa-library" D1 database, written into
+#                            wrangler.jsonc as d1_databases[0].database_id.
+# The committed wrangler.jsonc holds PLACEHOLDERS for both ids (the repository
+# is public); the "Fill account-specific ids" step below writes the real values
+# in on the runner just before `wrangler deploy`. Nothing is committed back.
 #
 # Worker secret (set ONCE, out of band — NOT a GitHub secret, never printed here):
 #   DEEPSEEK_API_KEY — `npx wrangler secret put DEEPSEEK_API_KEY` (or the
@@ -99,13 +105,62 @@ jobs:
           fi
           echo "ok=$ok" >> "$GITHUB_OUTPUT"
 
+      - name: Fill account-specific ids into wrangler.jsonc
+        # wrangler.jsonc ships with placeholders instead of this account's ids:
+        #   "<your-cloudflare-account-id>"          (vars.CF_AIG_ACCOUNT_ID)
+        #       <- secret CLOUDFLARE_ACCOUNT_ID
+        #   "00000000-0000-0000-0000-000000000000"  (d1_databases[0].database_id)
+        #       <- secret PA_LIBRARY_DATABASE_ID
+        # A placeholder is only filled while it is still present, so a fork that
+        # writes its own ids straight into wrangler.jsonc needs no extra secret.
+        # A missing or malformed value stops the deploy with an error instead of
+        # shipping a placeholder. Secret values are masked in the log.
+        if: ${{ steps.creds.outputs.ok == 'true' }}
+        env:
+          ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          LIBRARY_DATABASE_ID: ${{ secrets.PA_LIBRARY_DATABASE_ID }}
+        run: |
+          set -euo pipefail
+          file=wrangler.jsonc
+          account_placeholder='<your-cloudflare-account-id>'
+          database_placeholder='00000000-0000-0000-0000-000000000000'
+          ACCOUNT_ID="$(printf '%s' "$ACCOUNT_ID" | tr -d '[:space:]')"
+          LIBRARY_DATABASE_ID="$(printf '%s' "$LIBRARY_DATABASE_ID" | tr -d '[:space:]')"
+
+          if grep -qF -- "$account_placeholder" "$file"; then
+            if ! printf '%s' "$ACCOUNT_ID" | grep -qE '^[0-9a-fA-F]{32}$'; then
+              echo "::error::CLOUDFLARE_ACCOUNT_ID is not a 32-character hex account id, so CF_AIG_ACCOUNT_ID in $file cannot be filled."
+              exit 1
+            fi
+            sed -i "s|$account_placeholder|$ACCOUNT_ID|" "$file"
+          fi
+
+          if grep -qF -- "$database_placeholder" "$file"; then
+            if [ -z "$LIBRARY_DATABASE_ID" ]; then
+              echo "::error::$file still has the placeholder D1 database_id and the PA_LIBRARY_DATABASE_ID secret is not set. Add that secret (the id of your pa-library D1 database), or put the id in $file."
+              exit 1
+            fi
+            if ! printf '%s' "$LIBRARY_DATABASE_ID" | grep -qE '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'; then
+              echo "::error::PA_LIBRARY_DATABASE_ID is not a D1 database id (expected a UUID such as the one shown in the D1 dashboard)."
+              exit 1
+            fi
+            sed -i "s|$database_placeholder|$LIBRARY_DATABASE_ID|" "$file"
+          fi
+
+          if grep -qF -e "$account_placeholder" -e "$database_placeholder" "$file"; then
+            echo "::error::a placeholder is still present in $file after filling; refusing to deploy."
+            exit 1
+          fi
+          echo "wrangler.jsonc: no placeholders remain; ready to deploy."
+
       - name: Build container image + deploy Worker
         # The runner's Docker builds container/Dockerfile and pushes it; wrangler
         # then deploys the Worker + PaContainer Durable Object. Reminder: the
         # DEEPSEEK_API_KEY Worker secret is set ONCE via `wrangler secret put`
         # (or the dashboard) — it is intentionally NOT provided here and is never
-        # printed. Plain (non-secret) vars (CF_AIG_ACCOUNT_ID / CF_AIG_GATEWAY_ID
-        # / DEEPSEEK_MODEL / …) come from wrangler.jsonc.
+        # printed. Plain (non-secret) vars (CF_AIG_GATEWAY_ID / DEEPSEEK_MODEL /
+        # …) come from wrangler.jsonc; CF_AIG_ACCOUNT_ID too, as filled in by the
+        # step above.
         if: ${{ steps.creds.outputs.ok == 'true' }}
         uses: cloudflare/wrangler-action@v3
         with:
