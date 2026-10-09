@@ -253,7 +253,7 @@ Normal cohort completion uses `Idempotency-Key: pa-policy-extractor/cohort-run/<
 
    ```jsonc
    "vars": {
-     "CF_AIG_ACCOUNT_ID": "<your-account-id>",
+     "CF_AIG_ACCOUNT_ID": "<your-cloudflare-account-id>",
      "CF_AIG_GATEWAY_ID": "<your-gateway-id>",
      "DEEPSEEK_MODEL": "deepseek-v4-pro",
      "DEEPSEEK_THINKING": "on",
